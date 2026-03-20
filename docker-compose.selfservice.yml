@@ -17,7 +17,7 @@ services:
       context: ${GOCLAW_DIR:-.}/ui/web
       dockerfile: Dockerfile
     ports:
-      - "${GOCLAW_UI_PORT:-3000}:80"
+      - "${GOCLAW_UI_PORT:-4000}:80"
     networks:
       - default
       - goclaw-net
