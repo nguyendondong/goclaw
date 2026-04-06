@@ -13,7 +13,11 @@ WORKDIR /app
 # Copy .npmrc first so pnpm resolves musl native bindings (needed on Alpine).
 # The lockfile already includes musl entries thanks to supportedArchitectures in .npmrc.
 COPY ui/web/.npmrc ui/web/package.json ui/web/pnpm-lock.yaml ./
-RUN pnpm install --frozen-lockfile
+# Use --no-frozen-lockfile so pnpm can fetch musl native bindings missing from macOS-generated lockfile.
+# Lockfile is still copied above to pin versions; .npmrc sets supportedArchitectures for Alpine (musl).
+RUN pnpm install --no-frozen-lockfile
+RUN pnpm add -D @rollup/rollup-linux-x64-musl
+
 COPY ui/web/ .
 RUN pnpm build
 
