@@ -1,5 +1,5 @@
 import { useTranslation } from "react-i18next";
-import { Trash2, Pencil } from "lucide-react";
+import { Trash2, Pencil, KeyRound } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { cn } from "@/lib/utils";
@@ -32,27 +32,33 @@ export function CliCredentialGrantCard({ grant, agentName, isActive, disabled, o
     >
       <div className="flex items-start justify-between gap-2">
         <div className="min-w-0 flex-1">
-          <div className="flex items-center gap-1.5">
+          <div className="flex items-center gap-1.5 flex-wrap">
             <span className="text-sm font-medium">{agentName}</span>
             {!grant.enabled && (
-              <Badge variant="secondary" className="text-[10px] px-1.5 py-0">{tc("disabled")}</Badge>
+              <Badge variant="secondary" className="text-2xs px-1.5 py-0">{tc("disabled")}</Badge>
+            )}
+            {grant.env_set && (
+              <Badge variant="outline" className="text-2xs px-1.5 py-0 gap-0.5">
+                <KeyRound className="h-2.5 w-2.5" />
+                {t("grants.envVars.title")}
+              </Badge>
             )}
             {isActive && <Pencil className="h-3 w-3 text-muted-foreground" />}
           </div>
           {hasOverrides ? (
             <div className="mt-1 flex flex-wrap gap-1">
               {grant.timeout_seconds != null && (
-                <Badge variant="outline" className="font-mono text-[10px] px-1.5 py-0">
+                <Badge variant="outline" className="font-mono text-2xs px-1.5 py-0">
                   timeout: {grant.timeout_seconds}s
                 </Badge>
               )}
               {grant.deny_args && (
-                <Badge variant="outline" className="font-mono text-[10px] px-1.5 py-0">
+                <Badge variant="outline" className="font-mono text-2xs px-1.5 py-0">
                   deny: {grant.deny_args.length} rules
                 </Badge>
               )}
               {grant.tips && (
-                <Badge variant="outline" className="font-mono text-[10px] px-1.5 py-0 max-w-[200px] truncate">
+                <Badge variant="outline" className="font-mono text-2xs px-1.5 py-0 max-w-[200px] truncate">
                   tips: {grant.tips}
                 </Badge>
               )}

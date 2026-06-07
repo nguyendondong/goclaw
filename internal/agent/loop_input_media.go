@@ -3,17 +3,35 @@ package agent
 import (
 	"context"
 	"log/slog"
+	"os"
+	"path/filepath"
+	"strings"
 
 	"github.com/nextlevelbuilder/goclaw/internal/bus"
 	"github.com/nextlevelbuilder/goclaw/internal/providers"
 	"github.com/nextlevelbuilder/goclaw/internal/tools"
 )
 
+// isTextMime returns true for MIME types representing human-readable text content.
+// Covers text/* family plus common application/* types that are text-based.
+func isTextMime(mime string) bool {
+	if strings.HasPrefix(mime, "text/") {
+		return true
+	}
+	switch mime {
+	case "application/json", "application/xml", "application/yaml",
+		"application/x-yaml", "application/javascript":
+		return true
+	}
+	return false
+}
+
 // collectRefsByKind gathers MediaRefs of a given kind from message history
-// (reverse order) and current-turn refs. Historical first, current last.
+// in chronological order, then appends current-turn refs. The last ref is the
+// newest document for read_document's omitted media_id fallback.
 func collectRefsByKind(messages []providers.Message, currentRefs []providers.MediaRef, kind string) []providers.MediaRef {
 	var refs []providers.MediaRef
-	for i := len(messages) - 1; i >= 0; i-- {
+	for i := range messages {
 		for _, ref := range messages[i].MediaRefs {
 			if ref.Kind == kind {
 				refs = append(refs, ref)
@@ -47,11 +65,23 @@ func (l *Loop) enrichInputMedia(ctx context.Context, req *RunRequest, messages [
 	var mediaRefs []providers.MediaRef
 	if len(req.Media) > 0 {
 		mediaRefs = l.persistMedia(req.SessionKey, req.Media, tools.ToolWorkspaceFromCtx(ctx))
+
+		// Register persisted text uploads in vault (async, non-blocking).
+		if l.onTextUploaded != nil {
+			for _, ref := range mediaRefs {
+				if ref.Path != "" && isTextMime(ref.MimeType) {
+					if content, err := os.ReadFile(ref.Path); err == nil {
+						go l.onTextUploaded(context.WithoutCancel(ctx), ref.Path, string(content))
+					}
+				}
+			}
+		}
+
 		// Load current-turn images from persisted refs (Path is always set for new uploads).
 		var imageFiles []bus.MediaFile
 		for _, ref := range mediaRefs {
 			if ref.Kind == "image" && ref.Path != "" {
-				imageFiles = append(imageFiles, bus.MediaFile{Path: ref.Path, MimeType: ref.MimeType})
+				imageFiles = append(imageFiles, bus.MediaFile{Path: ref.Path, MimeType: ref.MimeType, Filename: filepath.Base(ref.Path)})
 			}
 		}
 		if deferToReadImageTool {

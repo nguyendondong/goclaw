@@ -14,6 +14,7 @@ import (
 type ListFilesTool struct {
 	workspace       string
 	restrict        bool
+	allowedPrefixes []string // extra allowed path prefixes (e.g. skills dirs)
 	deniedPrefixes  []string // path prefixes to deny access to (e.g. .goclaw)
 	sandboxMgr      sandbox.Manager
 	contextFileIntc *ContextFileInterceptor // unused, satisfies InterceptorAware
@@ -26,6 +27,12 @@ func (t *ListFilesTool) SetContextFileInterceptor(intc *ContextFileInterceptor) 
 
 func (t *ListFilesTool) SetMemoryInterceptor(intc *MemoryInterceptor) {
 	t.memIntc = intc
+}
+
+// AllowPaths adds extra path prefixes that list_files is allowed to access
+// even when restrict_to_workspace is true (e.g. skills directories).
+func (t *ListFilesTool) AllowPaths(prefixes ...string) {
+	t.allowedPrefixes = append(t.allowedPrefixes, prefixes...)
 }
 
 // DenyPaths adds path prefixes that list_files must reject/filter.
@@ -88,7 +95,7 @@ func (t *ListFilesTool) Execute(ctx context.Context, args map[string]any) *Resul
 	if workspace == "" {
 		workspace = t.workspace
 	}
-	allowed := allowedWithTeamWorkspace(ctx, nil)
+	allowed := allowedWithTeamWorkspace(ctx, t.allowedPrefixes)
 	resolved, err := resolvePathWithAllowed(path, workspace, effectiveRestrict(ctx, t.restrict), allowed)
 	if err != nil {
 		return ErrorResult(err.Error())
@@ -133,14 +140,13 @@ func (t *ListFilesTool) Execute(ctx context.Context, args map[string]any) *Resul
 }
 
 func (t *ListFilesTool) executeInSandbox(ctx context.Context, path, sandboxKey string) *Result {
-	bridge, err := t.getFsBridge(ctx, sandboxKey)
-	if err != nil {
-		return ErrorResult(fmt.Sprintf("sandbox error: %v", err))
-	}
-
 	containerCwd, cwdErr := SandboxCwd(ctx, t.workspace, sandbox.DefaultContainerWorkdir)
 	if cwdErr != nil {
 		return ErrorResult(fmt.Sprintf("sandbox path mapping: %v", cwdErr))
+	}
+	bridge, err := t.getFsBridge(ctx, sandboxKey, containerCwd)
+	if err != nil {
+		return ErrorResult(fmt.Sprintf("sandbox error: %v", err))
 	}
 	containerPath := ResolveSandboxPath(path, containerCwd)
 
@@ -152,10 +158,10 @@ func (t *ListFilesTool) executeInSandbox(ctx context.Context, path, sandboxKey s
 	return SilentResult(output)
 }
 
-func (t *ListFilesTool) getFsBridge(ctx context.Context, sandboxKey string) (*sandbox.FsBridge, error) {
+func (t *ListFilesTool) getFsBridge(ctx context.Context, sandboxKey, containerCwd string) (*sandbox.FsBridge, error) {
 	sb, err := t.sandboxMgr.Get(ctx, sandboxKey, t.workspace, SandboxConfigFromCtx(ctx))
 	if err != nil {
 		return nil, err
 	}
-	return sandbox.NewFsBridge(sb.ID(), sandbox.DefaultContainerWorkdir), nil
+	return sandbox.NewFsBridge(sb.ID(), containerCwd), nil
 }

@@ -1,5 +1,7 @@
 package providers
 
+import "slices"
+
 import "strings"
 
 // ReasoningCapability describes the supported reasoning levels for a model.
@@ -14,12 +16,7 @@ func (c *ReasoningCapability) Supports(level string) bool {
 	if c == nil || level == "" {
 		return false
 	}
-	for _, supported := range c.Levels {
-		if supported == level {
-			return true
-		}
-	}
-	return false
+	return slices.Contains(c.Levels, level)
 }
 
 type reasoningCapabilityEntry struct {
@@ -28,6 +25,7 @@ type reasoningCapabilityEntry struct {
 }
 
 var reasoningCapabilityEntries = []reasoningCapabilityEntry{
+	{id: "gpt-5.5", capability: ReasoningCapability{Levels: []string{"none", "low", "medium", "high", "xhigh"}, DefaultEffort: "medium"}},
 	{id: "gpt-5.4-mini", capability: ReasoningCapability{Levels: []string{"none", "low", "medium", "high", "xhigh"}, DefaultEffort: "none"}},
 	{id: "gpt-5-mini", capability: ReasoningCapability{Levels: []string{"none", "low", "medium", "high", "xhigh"}, DefaultEffort: "none"}},
 	{id: "gpt-5.4", capability: ReasoningCapability{Levels: []string{"none", "low", "medium", "high", "xhigh"}, DefaultEffort: "none"}},

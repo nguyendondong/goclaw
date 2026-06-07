@@ -2,7 +2,6 @@ package http
 
 import (
 	"context"
-	"encoding/json"
 	"log/slog"
 	"net/http"
 	"time"
@@ -12,6 +11,7 @@ import (
 	"github.com/nextlevelbuilder/goclaw/internal/providerresolve"
 	"github.com/nextlevelbuilder/goclaw/internal/providers"
 	"github.com/nextlevelbuilder/goclaw/internal/store"
+	usagecaps "github.com/nextlevelbuilder/goclaw/internal/usage/caps"
 )
 
 // PendingMessagesHandler handles pending message HTTP endpoints.
@@ -23,6 +23,7 @@ type PendingMessagesHandler struct {
 	maxTokens   int    // max output tokens for LLM summarization (0 = use default)
 	cfgProvider string // config-level provider override (empty = resolve from agent)
 	cfgModel    string // config-level model override (empty = resolve from agent)
+	usageCaps   *usagecaps.Service
 }
 
 func NewPendingMessagesHandler(s store.PendingMessageStore, agentStore store.AgentStore, providerReg *providers.Registry) *PendingMessagesHandler {
@@ -39,6 +40,10 @@ func (h *PendingMessagesHandler) SetMaxTokens(n int) { h.maxTokens = n }
 func (h *PendingMessagesHandler) SetProviderModel(provider, model string) {
 	h.cfgProvider = provider
 	h.cfgModel = model
+}
+
+func (h *PendingMessagesHandler) SetUsageCapService(s *usagecaps.Service) {
+	h.usageCaps = s
 }
 
 func (h *PendingMessagesHandler) RegisterRoutes(mux *http.ServeMux) {
@@ -117,8 +122,7 @@ type compactRequest struct {
 func (h *PendingMessagesHandler) handleCompact(w http.ResponseWriter, r *http.Request) {
 	locale := store.LocaleFromContext(r.Context())
 	var req compactRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": i18n.T(locale, i18n.MsgInvalidJSON)})
+	if !bindJSON(w, r, locale, &req) {
 		return
 	}
 	if req.ChannelName == "" || req.HistoryKey == "" {
@@ -150,7 +154,7 @@ func (h *PendingMessagesHandler) handleCompact(w http.ResponseWriter, r *http.Re
 	go func() {
 		ctx, cancel := context.WithTimeout(store.WithTenantID(context.Background(), tenantID), 180*time.Second)
 		defer cancel()
-		remaining, err := channels.CompactGroup(ctx, h.store, req.ChannelName, req.HistoryKey, provider, model, keepRecent, h.maxTokens)
+		remaining, err := channels.CompactGroup(ctx, h.store, req.ChannelName, req.HistoryKey, provider, model, keepRecent, h.maxTokens, h.usageCaps)
 		if err != nil {
 			slog.Warn("compact.failed", "channel", req.ChannelName, "key", req.HistoryKey, "error", err)
 		} else {

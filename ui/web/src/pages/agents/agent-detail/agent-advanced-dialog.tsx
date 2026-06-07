@@ -8,12 +8,12 @@ import {
 import { ConfigGroupHeader } from "@/components/shared/config-group-header";
 import type {
   AgentData, ChatGPTOAuthRoutingConfig, CompactionConfig, ContextPruningConfig,
-  ReasoningOverrideMode,
+  ModelFallbackConfig, ReasoningOverrideMode,
   SandboxConfig, WorkspaceSharingConfig,
 } from "@/types/agent";
 import {
   ChatGPTOAuthRoutingSection, ThinkingSection, WorkspaceSharingSection, CompactionSection,
-  ContextPruningSection, SandboxSection,
+  ContextPruningSection, InboundDebounceSection, ModelFallbackSection, SandboxSection,
 } from "./config-sections";
 import { WorkspaceSection } from "./general-sections";
 import { useProviders } from "@/pages/providers/hooks/use-providers";
@@ -21,17 +21,9 @@ import { useProviderModels } from "@/pages/providers/hooks/use-provider-models";
 import {
   getChatGPTOAuthProviderRouting,
   getProviderReasoningDefaults,
-  normalizeReasoningEffort,
-  normalizeReasoningFallback,
   deriveLegacyThinkingLevel,
 } from "@/types/provider";
-import {
-  buildAgentOtherConfigWithChatGPTOAuthRouting,
-  normalizeChatGPTOAuthRouting,
-} from "./agent-display-utils";
-import { buildDraftRouting } from "./codex-pool-routing-draft-utils";
-
-const SIMPLE_REASONING_LEVELS = new Set(["off", "low", "medium", "high"]);
+import { deriveState, buildAdvancedUpdatePayload } from "./agent-advanced-state-utils";
 
 interface AgentAdvancedDialogProps {
   open: boolean;
@@ -55,48 +47,7 @@ export function AgentAdvancedDialog({ open, onOpenChange, agent, onUpdate }: Age
   )?.reasoning ?? null;
   const expertReasoningAvailable = Boolean(currentModelCapability?.levels?.length);
 
-  const deriveState = (a: AgentData) => {
-    const otherObj = (a.other_config ?? {}) as Record<string, unknown>;
-    const rawReasoning = (otherObj.reasoning ?? {}) as Record<string, unknown>;
-    const rawThinkingLevel = normalizeReasoningEffort(otherObj.thinking_level);
-    const hasReasoningObject = Boolean(otherObj.reasoning) && typeof rawReasoning === "object";
-    const reasoningMode: ReasoningOverrideMode = rawReasoning.override_mode === "inherit"
-      ? "inherit"
-      : hasReasoningObject || rawThinkingLevel
-        ? "custom"
-        : "inherit";
-    const reasoningEffort = normalizeReasoningEffort(rawReasoning.effort)
-      || rawThinkingLevel
-      || providerReasoningDefaults?.effort
-      || "off";
-    const reasoningFallback = normalizeReasoningFallback(rawReasoning.fallback);
-    const routing = normalizeChatGPTOAuthRouting(a.other_config);
-    const draftRouting = buildDraftRouting(routing);
-    return {
-      reasoningMode,
-      thinkingLevel: SIMPLE_REASONING_LEVELS.has(reasoningEffort)
-        ? reasoningEffort
-        : deriveLegacyThinkingLevel(reasoningEffort),
-      reasoningEffort,
-      reasoningFallback: reasoningMode === "inherit"
-        ? providerReasoningDefaults?.fallback ?? "downgrade"
-        : reasoningFallback,
-      reasoningExpert: reasoningMode === "custom" && (
-        Boolean(otherObj.reasoning)
-        || !SIMPLE_REASONING_LEVELS.has(reasoningEffort)
-        || reasoningFallback !== "downgrade"
-      ),
-      chatgptRouting: draftRouting,
-      wsSharing: (otherObj.workspace_sharing ?? {}) as WorkspaceSharingConfig,
-      comp: a.compaction_config ?? {},
-      pruneEnabled: a.context_pruning?.mode !== "off",
-      prune: a.context_pruning ?? {},
-      sbEnabled: a.sandbox_config != null,
-      sb: a.sandbox_config ?? {},
-    };
-  };
-
-  const init = deriveState(agent);
+  const init = deriveState(agent, currentProvider);
   const [wsSharing, setWsSharing] = useState<WorkspaceSharingConfig>(init.wsSharing);
   const [reasoningMode, setReasoningMode] = useState<ReasoningOverrideMode>(init.reasoningMode);
   const [thinkingLevel, setThinkingLevel] = useState(init.thinkingLevel);
@@ -104,7 +55,10 @@ export function AgentAdvancedDialog({ open, onOpenChange, agent, onUpdate }: Age
   const [reasoningFallback, setReasoningFallback] = useState<string>(init.reasoningFallback);
   const [reasoningExpert, setReasoningExpert] = useState(init.reasoningExpert);
   const [chatgptRouting, setChatgptRouting] = useState<ChatGPTOAuthRoutingConfig>(init.chatgptRouting);
+  const [modelFallback, setModelFallback] = useState<ModelFallbackConfig>(init.modelFallback);
   const [comp, setComp] = useState<CompactionConfig>(init.comp);
+  const [inboundDebounceMode, setInboundDebounceMode] = useState(init.inboundDebounceMode);
+  const [inboundDebounceMs, setInboundDebounceMs] = useState(init.inboundDebounceMs);
   const [pruneEnabled, setPruneEnabled] = useState(init.pruneEnabled);
   const [prune, setPrune] = useState<ContextPruningConfig>(init.prune);
   const [sbEnabled, setSbEnabled] = useState(init.sbEnabled);
@@ -114,20 +68,23 @@ export function AgentAdvancedDialog({ open, onOpenChange, agent, onUpdate }: Age
   useEffect(() => {
     if (!open) return;
     refreshProviders();
-    const s = deriveState(agent);
+    const s = deriveState(agent, currentProvider);
     setReasoningMode(s.reasoningMode);
     setThinkingLevel(s.thinkingLevel);
     setReasoningEffort(s.reasoningEffort);
     setReasoningFallback(s.reasoningFallback);
     setReasoningExpert(s.reasoningExpert);
     setChatgptRouting(s.chatgptRouting);
+    setModelFallback(s.modelFallback);
     setWsSharing(s.wsSharing);
     setComp(s.comp);
+    setInboundDebounceMode(s.inboundDebounceMode);
+    setInboundDebounceMs(s.inboundDebounceMs);
     setPruneEnabled(s.pruneEnabled);
     setPrune(s.prune);
     setSbEnabled(s.sbEnabled);
     setSb(s.sb);
-  // eslint-disable-next-line react-hooks/exhaustive-deps
+   
   }, [open]);
 
   useEffect(() => {
@@ -161,49 +118,29 @@ export function AgentAdvancedDialog({ open, onOpenChange, agent, onUpdate }: Age
   const handleSave = async () => {
     setSaving(true);
     try {
-      // Only send the keys this dialog owns to avoid overwriting keys managed by
-      // the overview tab. The backend does a full column replace, so we must read
-      // the latest agent data and merge our keys into it.
-      const otherBase = buildAgentOtherConfigWithChatGPTOAuthRouting(
+      const updates = buildAdvancedUpdatePayload({
         agent,
+        currentProvider,
+        providersLoading,
+        providerModelsLoading,
+        expertReasoningAvailable,
+        reasoningMode,
+        reasoningEffort,
+        reasoningExpert,
+        reasoningFallback,
+        thinkingLevel,
         chatgptRouting,
-        currentProvider?.settings,
-      );
-      delete otherBase.thinking_level;
-      delete otherBase.reasoning;
-      delete otherBase.workspace_sharing;
-      const capabilityResolutionPending = !currentProvider || providersLoading || providerModelsLoading;
-      if (reasoningMode === "inherit") {
-        otherBase.reasoning = {
-          override_mode: "inherit",
-        };
-      } else {
-        const shouldPersistExpertReasoning = reasoningExpert
-          && (expertReasoningAvailable || capabilityResolutionPending);
-        const requestedEffort = shouldPersistExpertReasoning ? reasoningEffort : thinkingLevel;
-        const legacyThinkingLevel = deriveLegacyThinkingLevel(requestedEffort);
-        if (legacyThinkingLevel !== "off") {
-          otherBase.thinking_level = legacyThinkingLevel;
-        }
-        const reasoningConfig: Record<string, unknown> = {
-          override_mode: "custom",
-          effort: requestedEffort,
-        };
-        if (reasoningFallback !== "downgrade") reasoningConfig.fallback = reasoningFallback;
-        otherBase.reasoning = reasoningConfig;
-      }
-      if (
-        wsSharing.shared_dm || wsSharing.shared_group ||
-        (wsSharing.shared_users?.length ?? 0) > 0 || wsSharing.share_memory
-      ) {
-        otherBase.workspace_sharing = wsSharing;
-      }
-      await onUpdate({
-        compaction_config: comp,
-        context_pruning: pruneEnabled ? (Object.keys(prune).length > 0 ? prune : null) : { mode: "off" },
-        sandbox_config: sbEnabled ? sb : null,
-        other_config: otherBase,
+        modelFallback,
+        wsSharing,
+        comp,
+        inboundDebounceMode,
+        inboundDebounceMs,
+        pruneEnabled,
+        prune,
+        sbEnabled,
+        sb,
       });
+      await onUpdate(updates);
       onOpenChange(false);
     } catch {
       // toast shown by hook — keep dialog open
@@ -283,6 +220,14 @@ export function AgentAdvancedDialog({ open, onOpenChange, agent, onUpdate }: Age
             }
           />
 
+          <ModelFallbackSection
+            primaryProvider={agent.provider}
+            primaryModel={agent.model}
+            providers={providers}
+            value={modelFallback}
+            onChange={setModelFallback}
+          />
+
           {/* Performance */}
           <ConfigGroupHeader
             title={t("configGroups.performance")}
@@ -290,6 +235,12 @@ export function AgentAdvancedDialog({ open, onOpenChange, agent, onUpdate }: Age
           />
           <div className="space-y-4">
             <CompactionSection value={comp} onChange={setComp} />
+            <InboundDebounceSection
+              mode={inboundDebounceMode}
+              debounceMs={inboundDebounceMs}
+              onModeChange={setInboundDebounceMode}
+              onDebounceMsChange={setInboundDebounceMs}
+            />
             <ContextPruningSection
               enabled={pruneEnabled}
               value={prune}

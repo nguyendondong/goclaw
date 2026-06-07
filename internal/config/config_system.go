@@ -1,6 +1,7 @@
 package config
 
 import (
+	"encoding/json"
 	"strconv"
 )
 
@@ -52,10 +53,34 @@ func (c *Config) ApplySystemConfigs(configs map[string]string) {
 	boolean("gateway.tool_status", &c.Gateway.ToolStatus)
 	integer("gateway.task_recovery_interval_sec", &c.Gateway.TaskRecoveryIntervalSec)
 
+	// Background workers (vault enrichment, consolidation)
+	str("background.provider", &c.Gateway.BackgroundProvider)
+	str("background.model", &c.Gateway.BackgroundModel)
+
 	// Tools
 	str("tools.profile", &c.Tools.Profile)
 	integer("tools.rate_limit_per_hour", &c.Tools.RateLimitPerHour)
 	boolean("tools.scrub_credentials", &c.Tools.ScrubCredentials)
+	boolValue := func(key string, dst *bool) {
+		if v, ok := configs[key]; ok && v != "" {
+			*dst = v == "true" || v == "1"
+		}
+	}
+	boolValue("tools.browser.enabled", &c.Tools.Browser.Enabled)
+	boolValue("tools.browser.headless", &c.Tools.Browser.Headless)
+	str("tools.browser.remote_url", &c.Tools.Browser.RemoteURL)
+	integer("tools.browser.action_timeout_ms", &c.Tools.Browser.ActionTimeoutMs)
+	integer("tools.browser.idle_timeout_ms", &c.Tools.Browser.IdleTimeoutMs)
+	integer("tools.browser.max_pages", &c.Tools.Browser.MaxPages)
+	boolValue("tools.browser.cookie_sync_enabled", &c.Tools.Browser.CookieSyncEnabled)
+
+	// Skills
+	integer(SkillMaxUploadSizeSystemConfigKey, &c.Skills.MaxUploadSizeMB)
+	c.Skills.MaxUploadSizeMB = ClampSkillMaxUploadSizeMB(c.Skills.MaxUploadSizeMB)
+	boolean(SkillSlashCommandsEnabledSystemConfigKey, &c.Skills.SlashCommands.Enabled)
+	boolean(SkillSlashSuggestNotFoundSystemConfigKey, &c.Skills.SlashCommands.SuggestNotFound)
+	boolValue(SkillSlashPartialMatchingSystemConfigKey, &c.Skills.SlashCommands.PartialMatching)
+	str(SkillSlashCommandPrefixSystemConfigKey, &c.Skills.SlashCommands.Prefix)
 
 	// TTS
 	str("tts.provider", &c.Tts.Provider)
@@ -78,5 +103,13 @@ func (c *Config) ApplySystemConfigs(configs map[string]string) {
 		integer("compaction.max_tokens", &pc.MaxTokens)
 		str("compaction.provider", &pc.Provider)
 		str("compaction.model", &pc.Model)
+	}
+
+	// Allowed paths (JSON array)
+	if v, ok := configs["allowed_paths"]; ok && v != "" {
+		var paths []string
+		if err := json.Unmarshal([]byte(v), &paths); err == nil {
+			c.Agents.Defaults.AllowedPaths = paths
+		}
 	}
 }

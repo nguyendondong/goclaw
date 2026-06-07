@@ -8,30 +8,41 @@ import (
 
 // SkillInfo describes a discovered skill.
 type SkillInfo struct {
-	ID          string   `json:"id,omitempty"` // DB UUID
-	Name        string   `json:"name"`
-	Slug        string   `json:"slug"`
-	Path        string   `json:"path"`
-	BaseDir     string   `json:"baseDir"`
-	Source      string   `json:"source"`
-	Description string   `json:"description"`
-	Visibility  string   `json:"visibility,omitempty"`
-	Tags        []string `json:"tags,omitempty"`
-	Version     int      `json:"version,omitempty"`
-	IsSystem    bool     `json:"is_system,omitempty"`
-	Status      string   `json:"status,omitempty"`
-	Enabled     bool     `json:"enabled"`
-	Author      string   `json:"author,omitempty"`
-	MissingDeps []string `json:"missing_deps,omitempty"`
+	ID            string          `json:"id,omitempty" db:"id"` // DB UUID
+	TenantID      string          `json:"-" db:"tenant_id"`
+	Name          string          `json:"name" db:"name"`
+	Slug          string          `json:"slug" db:"slug"`
+	Path          string          `json:"path" db:"path"`
+	BaseDir       string          `json:"baseDir" db:"-"`
+	Source        string          `json:"source" db:"-"`
+	Description   string          `json:"description" db:"description"`
+	Visibility    string          `json:"visibility,omitempty" db:"visibility"`
+	OwnerID       string          `json:"-" db:"owner_id"`
+	Tags          []string        `json:"tags,omitempty" db:"tags"`
+	Version       int             `json:"version,omitempty" db:"version"`
+	IsSystem      bool            `json:"is_system,omitempty" db:"is_system"`
+	Status        string          `json:"status,omitempty" db:"status"`
+	Enabled       bool            `json:"enabled" db:"enabled"`
+	Author        string          `json:"author,omitempty" db:"author"`
+	CreatorAgent  *SkillAgentRef  `json:"creator_agent,omitempty" db:"-"`
+	ManagerAgents []SkillAgentRef `json:"manager_agents,omitempty" db:"-"`
+	MissingDeps   []string        `json:"missing_deps,omitempty" db:"missing_deps"`
+}
+
+// SkillAgentRef is a small UI/API-safe agent reference for skill metadata.
+type SkillAgentRef struct {
+	ID          string `json:"id,omitempty" db:"id"`
+	AgentKey    string `json:"agent_key,omitempty" db:"agent_key"`
+	DisplayName string `json:"display_name,omitempty" db:"display_name"`
 }
 
 // SkillSearchResult is a scored skill returned from embedding search.
 type SkillSearchResult struct {
-	Name        string  `json:"name"`
-	Slug        string  `json:"slug"`
-	Description string  `json:"description"`
-	Path        string  `json:"path"`
-	Score       float64 `json:"score"`
+	Name        string  `json:"name" db:"name"`
+	Slug        string  `json:"slug" db:"slug"`
+	Description string  `json:"description" db:"description"`
+	Path        string  `json:"path" db:"path"`
+	Score       float64 `json:"score" db:"score"`
 }
 
 // SkillStore manages skill discovery and loading.
@@ -81,15 +92,26 @@ type SkillCreateParams struct {
 
 // SkillWithGrantStatus is a skill with its grant status for a specific agent.
 type SkillWithGrantStatus struct {
-	ID          uuid.UUID `json:"id"`
-	Name        string    `json:"name"`
-	Slug        string    `json:"slug"`
-	Description string    `json:"description"`
-	Visibility  string    `json:"visibility"`
-	Version     int       `json:"version"`
-	Granted     bool      `json:"granted"`
-	PinnedVer   *int      `json:"pinned_version,omitempty"`
-	IsSystem    bool      `json:"is_system"`
+	ID          uuid.UUID `json:"id" db:"id"`
+	Name        string    `json:"name" db:"name"`
+	Slug        string    `json:"slug" db:"slug"`
+	Description string    `json:"description" db:"description"`
+	Visibility  string    `json:"visibility" db:"visibility"`
+	Version     int       `json:"version" db:"version"`
+	Granted     bool      `json:"granted" db:"granted"`
+	CanManage   bool      `json:"can_manage" db:"can_manage"`
+	PinnedVer   *int      `json:"pinned_version,omitempty" db:"pinned_version"`
+	IsSystem    bool      `json:"is_system" db:"is_system"`
+}
+
+// SkillAgentGrantInfo is a grant row for one skill across agents.
+type SkillAgentGrantInfo struct {
+	AgentID       uuid.UUID `json:"agent_id" db:"agent_id"`
+	AgentKey      string    `json:"agent_key,omitempty" db:"agent_key"`
+	DisplayName   string    `json:"display_name,omitempty" db:"display_name"`
+	PinnedVersion int       `json:"pinned_version" db:"pinned_version"`
+	GrantedBy     string    `json:"granted_by" db:"granted_by"`
+	CanManage     bool      `json:"can_manage" db:"can_manage"`
 }
 
 // SkillManageStore extends SkillStore with CRUD, ownership, and grant operations
@@ -108,6 +130,9 @@ type SkillManageStore interface {
 	GetSkillOwnerIDBySlug(ctx context.Context, slug string) (string, bool)
 	GetNextVersion(ctx context.Context, slug string) int
 	GetNextVersionLocked(ctx context.Context, slug string) (int, func() error, error)
+	// GetSkillHashBySlug returns the content hash and version of the latest non-deleted skill
+	// version for the given slug (tenant-scoped). Returns ok=false if no skill exists.
+	GetSkillHashBySlug(ctx context.Context, slug string) (hash string, version int, ok bool)
 	IsSystemSkill(slug string) bool
 	// System skill management
 	ListAllSkills(ctx context.Context) []SkillInfo
@@ -115,11 +140,13 @@ type SkillManageStore interface {
 	ListSystemSkillDirs(ctx context.Context) map[string]string
 	StoreMissingDeps(ctx context.Context, id uuid.UUID, missing []string) error
 	// Grants
-	GrantToAgent(ctx context.Context, skillID, agentID uuid.UUID, version int, grantedBy string) error
+	GrantToAgent(ctx context.Context, skillID, agentID uuid.UUID, version int, grantedBy string, canManage ...bool) error
 	RevokeFromAgent(ctx context.Context, skillID, agentID uuid.UUID) error
 	GrantToUser(ctx context.Context, skillID uuid.UUID, userID, grantedBy string) error
 	RevokeFromUser(ctx context.Context, skillID uuid.UUID, userID string) error
 	ListWithGrantStatus(ctx context.Context, agentID uuid.UUID) ([]SkillWithGrantStatus, error)
+	ListAgentGrantsForSkill(ctx context.Context, skillID uuid.UUID) ([]SkillAgentGrantInfo, error)
+	AgentCanManageSkill(ctx context.Context, skillID, agentID uuid.UUID) (bool, error)
 	// Files
 	GetSkillFilePath(ctx context.Context, id uuid.UUID) (filePath string, slug string, version int, isSystem bool, ok bool)
 }

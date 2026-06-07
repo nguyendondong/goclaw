@@ -2,6 +2,7 @@ package telegram
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net"
@@ -14,6 +15,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/mymmrac/telego"
 
+	"github.com/nextlevelbuilder/goclaw/internal/audio"
 	"github.com/nextlevelbuilder/goclaw/internal/bus"
 	"github.com/nextlevelbuilder/goclaw/internal/channels"
 	"github.com/nextlevelbuilder/goclaw/internal/config"
@@ -27,8 +29,7 @@ type Channel struct {
 	config            config.TelegramConfig
 	httpClient        *http.Client
 	transport         *http.Transport
-	ipv4Once          sync.Once // guards enableIPv4Only to prevent data race
-	pairingService    store.PairingStore
+	ipv4Once          sync.Once                   // guards enableIPv4Only to prevent data race
 	agentStore        store.AgentStore            // for agent key lookup (nil if not configured)
 	configPermStore   store.ConfigPermissionStore // for group file writer management (nil if not configured)
 	teamStore         store.TeamStore             // for /tasks, /task_detail commands (nil if not configured)
@@ -37,18 +38,21 @@ type Channel struct {
 	stopThinking      sync.Map                    // localKey string → *thinkingCancel
 	typingCtrls       sync.Map                    // localKey string → *typing.Controller
 	reactions         sync.Map                    // localKey string → *StatusReactionController
-	pairingReplySent  sync.Map                    // userID string → time.Time (debounce pairing replies)
 	threadIDs         sync.Map                    // localKey string → messageThreadID int (for forum topic routing)
-	approvedGroups    sync.Map                    // chatIDStr string → true (cached group pairing approval)
-	groupHistory      *channels.PendingHistory
-	historyLimit      int
-	requireMention    bool
-	mentionMode       string             // "strict" (default) or "yield"
-	pollCancel        context.CancelFunc // cancels the long polling context
-	pollDone          chan struct{}      // closed when polling goroutine exits
-	handlerWg         sync.WaitGroup     // tracks in-flight handler goroutines for graceful shutdown
-	handlerSem        chan struct{}      // bounded semaphore for concurrent handler goroutines
-	pendingDraftID    sync.Map           // localKey string → int (draftID)
+	mentionMode       string                      // "strict" (default) or "yield"
+	botDisplayName    string                      // bot's first_name from GetMe (e.g. "ViệtBot"); captured once at Start
+	pollCtx           context.Context             // long-polling context (cancelled by pollCancel); promoted from Start-local so background helpers (e.g. albumAggregator) can derive from it
+	pollCancel        context.CancelFunc          // cancels the long polling context
+	pollDone          chan struct{}               // closed when polling goroutine exits
+	handlerWg         sync.WaitGroup              // tracks in-flight handler goroutines for graceful shutdown
+	handlerSem        chan struct{}               // bounded semaphore for concurrent handler goroutines
+	pendingDraftID    sync.Map                    // localKey string → int (draftID)
+	audioMgr          *audio.Manager              // unified STT via audio.Manager (nil = no STT)
+	albumAgg          *albumAggregator            // coalesces Telegram album members into a single dispatch; nil before Start
+	writerHealMu      sync.Mutex                  // guards writerHealLastTry for /writers self-heal
+	writerHealLastTry map[string]time.Time        // key "chatID|userID" → last attempt timestamp
+	// pairingService, approvedGroups, pairingDebounce, groupHistory, historyLimit, requireMention
+	// are inherited from channels.BaseChannel.
 }
 
 type thinkingCancel struct {
@@ -83,14 +87,15 @@ func WithSubagentTaskStore(s store.SubagentTaskStore) Option {
 // WithPendingMessageStore sets the pending message store for group history buffering.
 func WithPendingMessageStore(s store.PendingMessageStore) Option {
 	return func(c *Channel) {
-		c.groupHistory = channels.MakeHistory(channels.TypeTelegram, s, c.TenantID())
+		c.SetGroupHistory(channels.MakeHistory(channels.TypeTelegram, s, c.TenantID()))
 	}
 }
 
 // New creates a new Telegram channel from config.
 // pairingSvc is optional (nil = fall back to allowlist only).
+// audioMgr is optional (nil = STT disabled).
 // Optional stores are set via Option functions.
-func New(cfg config.TelegramConfig, msgBus *bus.MessageBus, pairingSvc store.PairingStore, chanOpts ...Option) (*Channel, error) {
+func New(cfg config.TelegramConfig, msgBus *bus.MessageBus, pairingSvc store.PairingStore, audioMgr *audio.Manager, chanOpts ...Option) (*Channel, error) {
 	var botOpts []telego.BotOption
 
 	if cfg.APIServer != "" {
@@ -111,7 +116,13 @@ func New(cfg config.TelegramConfig, msgBus *bus.MessageBus, pairingSvc store.Pai
 	}
 
 	httpClient := &http.Client{
-		Timeout:   60 * time.Second, // Must exceed getUpdates Timeout to avoid long-poll race (#361)
+		// Must exceed getUpdates long-poll Timeout (25s, #361) AND cover the
+		// longest per-attempt media upload. A 60s cap was killing multi-MB
+		// photo uploads on slow networks mid-flight (#628), even when the
+		// per-call ctx deadline was generous. 3 min matches
+		// sendMediaOverallTimeout so a single upload attempt can consume the
+		// full media budget when needed.
+		Timeout:   3 * time.Minute,
 		Transport: transport,
 	}
 	// Apply ForceIPv4 at init if configured (explicit, predictable, no runtime heuristic).
@@ -150,17 +161,18 @@ func New(cfg config.TelegramConfig, msgBus *bus.MessageBus, pairingSvc store.Pai
 	}
 
 	ch := &Channel{
-		BaseChannel:    base,
-		bot:            bot,
-		config:         cfg,
-		httpClient:     httpClient,
-		transport:      transport,
-		pairingService: pairingSvc,
-		groupHistory:   channels.MakeHistory(channels.TypeTelegram, nil, base.TenantID()),
-		historyLimit:   historyLimit,
-		requireMention: requireMention,
-		mentionMode:    mentionMode,
+		BaseChannel: base,
+		bot:         bot,
+		config:      cfg,
+		httpClient:  httpClient,
+		transport:   transport,
+		mentionMode: mentionMode,
+		audioMgr:    audioMgr,
 	}
+	ch.SetPairingService(pairingSvc)
+	ch.SetGroupHistory(channels.MakeHistory(channels.TypeTelegram, nil, base.TenantID()))
+	ch.SetHistoryLimit(historyLimit)
+	ch.SetRequireMention(requireMention)
 	for _, o := range chanOpts {
 		o(ch)
 	}
@@ -176,18 +188,50 @@ func (c *Channel) Start(ctx context.Context) error {
 	me, err := c.bot.GetMe(probeCtx)
 	probeCancel()
 	if err != nil {
-		return fmt.Errorf("validate telegram bot: %w", err)
+		if shouldRetryTelegramStartupWithIPv4(err) {
+			c.enableIPv4Only()
+			slog.Warn("telegram: startup probe retrying with IPv4 fallback", "error", sanitizeTelegramError(err, c.config.Token))
+
+			probeCtx, probeCancel = context.WithTimeout(ctx, probeOverallTimeout)
+			me, err = c.bot.GetMe(probeCtx)
+			probeCancel()
+		}
+	}
+	if err != nil {
+		return fmt.Errorf("validate telegram bot: %w", sanitizeTelegramError(err, c.config.Token))
 	}
 	username := ""
 	if me != nil {
 		username = me.Username
+		c.botDisplayName = me.FirstName
 	}
 
 	// Create a cancellable context for the polling goroutine.
 	// Stop() cancels this context to cleanly shut down long polling.
-	pollCtx, cancel := context.WithCancel(ctx)
-	c.pollCancel = cancel
+	c.pollCtx, c.pollCancel = context.WithCancel(ctx)
+	pollCtx := c.pollCtx
+	cancel := c.pollCancel
 	c.pollDone = make(chan struct{})
+
+	// Album aggregator coalesces Telegram media-group updates into ONE dispatch.
+	// flushFn closure captures c.pollCtx so silence-window flushes have a valid
+	// context for downstream media resolution + bus publish. Stop() drains
+	// synchronously BEFORE pollCancel so flushes never race ctx cancellation.
+	// handlerWg participation is REQUIRED: AfterFunc-fired flushes run on a
+	// dedicated goroutine NOT tracked by the polling loop. Without explicit
+	// Add/Done the Stop() handlerWg.Wait() would race the timer-spawned
+	// dispatch, breaking the "always publish in-flight bursts" invariant
+	// documented in CHANGELOG/docs/05-channels-messaging.md.
+	c.albumAgg = newAlbumAggregator(
+		albumAggregatorWindow,
+		albumAggregatorMaxBuffered,
+		albumAggregatorMaxBuffers,
+		func(rctx resolvedMessageContext, members []*telego.Message) {
+			c.handlerWg.Add(1)
+			defer c.handlerWg.Done()
+			c.processResolvedMessage(c.pollCtx, rctx, members)
+		},
+	)
 
 	updates, err := c.bot.UpdatesViaLongPolling(pollCtx, &telego.GetUpdatesParams{
 		Timeout: 25, // Long-poll seconds; keep below HTTP client Timeout (#361)
@@ -205,7 +249,9 @@ func (c *Channel) Start(ctx context.Context) error {
 
 	c.SetRunning(true)
 	c.MarkHealthy(connectedSummary(username))
-	c.groupHistory.StartFlusher()
+	if gh := c.GroupHistory(); gh != nil {
+		gh.StartFlusher()
+	}
 	c.handlerSem = make(chan struct{}, 20) // limit concurrent message handlers
 	slog.Info("telegram bot connected", "username", username)
 
@@ -334,11 +380,17 @@ func (c *Channel) BlockReplyEnabled() *bool { return c.config.BlockReply }
 
 // SetPendingCompaction configures LLM-based auto-compaction for pending messages.
 func (c *Channel) SetPendingCompaction(cfg *channels.CompactionConfig) {
-	c.groupHistory.SetCompactionConfig(cfg)
+	if gh := c.GroupHistory(); gh != nil {
+		gh.SetCompactionConfig(cfg)
+	}
 }
 
 // SetPendingHistoryTenantID propagates tenant_id to the pending history for DB operations.
-func (c *Channel) SetPendingHistoryTenantID(id uuid.UUID) { c.groupHistory.SetTenantID(id) }
+func (c *Channel) SetPendingHistoryTenantID(id uuid.UUID) {
+	if gh := c.GroupHistory(); gh != nil {
+		gh.SetTenantID(id)
+	}
+}
 
 // Stop shuts down the Telegram bot by cancelling the long polling context
 // and waiting for the polling goroutine to exit.
@@ -346,7 +398,15 @@ func (c *Channel) Stop(_ context.Context) error {
 	slog.Info("stopping telegram bot")
 	c.SetRunning(false)
 	c.MarkStopped("Stopped")
-	c.groupHistory.StopFlusher()
+	if gh := c.GroupHistory(); gh != nil {
+		gh.StopFlusher()
+	}
+
+	// Drain pending album buffers BEFORE cancelling pollCtx so any synchronous
+	// flushFn callbacks still see a valid context for downstream dispatch.
+	if c.albumAgg != nil {
+		c.albumAgg.Stop()
+	}
 
 	if c.pollCancel != nil {
 		c.pollCancel()
@@ -383,6 +443,51 @@ func connectedSummary(username string) string {
 		return "Connected"
 	}
 	return fmt.Sprintf("Connected as @%s", username)
+}
+
+type redactedTelegramError struct {
+	err   error
+	token string
+}
+
+func (e redactedTelegramError) Error() string {
+	msg := e.err.Error()
+	if e.token != "" {
+		msg = strings.ReplaceAll(msg, e.token, "<telegram-token>")
+	}
+	return msg
+}
+
+func (e redactedTelegramError) Unwrap() error { return e.err }
+
+func sanitizeTelegramError(err error, token string) error {
+	if err == nil {
+		return nil
+	}
+	return redactedTelegramError{err: err, token: token}
+}
+
+func shouldRetryTelegramStartupWithIPv4(err error) bool {
+	if err == nil {
+		return false
+	}
+	var dnsErr *net.DNSError
+	if errors.As(err, &dnsErr) {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	if strings.Contains(msg, "lookup") || strings.Contains(msg, "no such host") {
+		return false
+	}
+	if isRetryableNetworkErr(err) {
+		return true
+	}
+	if strings.Contains(msg, "network is unreachable") ||
+		strings.Contains(msg, "no route to host") ||
+		strings.Contains(msg, "deadline exceeded") {
+		return true
+	}
+	return false
 }
 
 // applyIPv4Dialer forces a transport to use IPv4 only by overriding DialContext.
@@ -477,8 +582,8 @@ func (c *Channel) migrateGroupChat(ctx context.Context, oldChatID, newChatID int
 		"old_chat_id", oldStr, "new_chat_id", newStr, "channel", c.Name())
 
 	// Update DB (paired_devices, sessions, channel_contacts).
-	if c.pairingService != nil {
-		if err := c.pairingService.MigrateGroupChatID(ctx, c.Name(), oldStr, newStr); err != nil {
+	if ps := c.PairingService(); ps != nil {
+		if err := ps.MigrateGroupChatID(ctx, c.Name(), oldStr, newStr); err != nil {
 			slog.Error("telegram: failed to migrate group chat in DB",
 				"old_chat_id", oldStr, "new_chat_id", newStr, "error", err)
 			return
@@ -486,15 +591,15 @@ func (c *Channel) migrateGroupChat(ctx context.Context, oldChatID, newChatID int
 	}
 
 	// Invalidate approvedGroups cache.
-	c.approvedGroups.Delete(oldStr)
-	c.approvedGroups.Store(newStr, true)
+	c.ClearGroupApproval(oldStr)
+	c.MarkGroupApproved(newStr)
 
 	// Clear pairing reply debounce for old group sender.
 	oldGroupSender := fmt.Sprintf("group:%d", oldChatID)
-	c.pairingReplySent.Delete(oldGroupSender)
+	c.ClearPairingDebounce(oldGroupSender)
 
 	// Clear in-memory pending history for old key (will rebuild from DB on next access).
-	if c.groupHistory != nil {
-		c.groupHistory.Clear(oldStr)
+	if gh := c.GroupHistory(); gh != nil {
+		gh.Clear(oldStr)
 	}
 }

@@ -27,6 +27,10 @@ import {
   KeyRound,
   Building2,
   ArrowLeftRight,
+  FileArchive,
+  DatabaseBackup,
+  Webhook,
+  MonitorCog,
 } from "lucide-react";
 import { useTranslation } from "react-i18next";
 import { SidebarGroup } from "./sidebar-group";
@@ -53,7 +57,7 @@ export function Sidebar({ collapsed, onNavItemClick }: SidebarProps) {
   return (
     <aside
       className={cn(
-        "flex h-full flex-col border-r bg-sidebar text-sidebar-foreground transition-all duration-200",
+        "flex h-full flex-col overflow-hidden overscroll-none border-r bg-sidebar text-sidebar-foreground transition-all duration-200",
         collapsed ? "w-16" : "w-64",
       )}
       onClick={(e) => {
@@ -79,10 +83,10 @@ export function Sidebar({ collapsed, onNavItemClick }: SidebarProps) {
       </div>
 
       {/* Nav items */}
-      <nav className="flex-1 space-y-4 overflow-y-auto px-2 py-4">
+      <nav className="flex-1 space-y-4 overflow-y-auto overscroll-contain px-2 py-4">
         <SidebarGroup label={t("groups.core")} collapsed={collapsed}>
           <SidebarItem to={ROUTES.OVERVIEW} icon={LayoutDashboard} label={t("nav.overview")} collapsed={collapsed} />
-          <SidebarItem to="/chat" icon={MessageSquare} label={t("nav.chat")} collapsed={collapsed} />
+          <SidebarItem to={ROUTES.CHAT} icon={MessageSquare} label={t("nav.chat")} collapsed={collapsed} />
           <SidebarItem to={ROUTES.AGENTS} icon={Bot} label={t("nav.agents")} collapsed={collapsed} />
           <SidebarItem to={ROUTES.TEAMS} icon={Users} label={t("nav.agentTeams")} collapsed={collapsed} />
         </SidebarGroup>
@@ -96,6 +100,9 @@ export function Sidebar({ collapsed, onNavItemClick }: SidebarProps) {
         <SidebarGroup label={t("groups.connectivity")} collapsed={collapsed}>
           <SidebarItem to={ROUTES.CHANNELS} icon={Radio} label={t("nav.channels")} collapsed={collapsed} />
           <SidebarItem to={ROUTES.NODES} icon={Link} label={t("nav.nodes")} collapsed={collapsed} badge={pendingCount} />
+          {isAdmin && (
+            <SidebarItem to={ROUTES.WORKSTATIONS} icon={MonitorCog} label={t("nav.workstations")} collapsed={collapsed} />
+          )}
         </SidebarGroup>
 
         <SidebarGroup label={t("groups.capabilities")} collapsed={collapsed}>
@@ -106,10 +113,12 @@ export function Sidebar({ collapsed, onNavItemClick }: SidebarProps) {
             <SidebarItem to={ROUTES.TTS} icon={Volume2} label={t("nav.tts")} collapsed={collapsed} />
           )}
           <SidebarItem to={ROUTES.CRON} icon={Clock} label={t("nav.cron")} collapsed={collapsed} />
+          <SidebarItem to={ROUTES.HOOKS} icon={Webhook} label={t("nav.hooks")} collapsed={collapsed} />
         </SidebarGroup>
 
         <SidebarGroup label={t("groups.data")} collapsed={collapsed}>
           <SidebarItem to={ROUTES.MEMORY} icon={Brain} label={t("nav.memory")} collapsed={collapsed} />
+          <SidebarItem to={ROUTES.VAULT} icon={FileArchive} label={t("nav.vault")} collapsed={collapsed} />
           <SidebarItem to={ROUTES.KNOWLEDGE_GRAPH} icon={Network} label={t("nav.knowledgeGraph")} collapsed={collapsed} />
           <SidebarItem to={ROUTES.STORAGE} icon={HardDrive} label={t("nav.storage")} collapsed={collapsed} />
         </SidebarGroup>
@@ -127,7 +136,6 @@ export function Sidebar({ collapsed, onNavItemClick }: SidebarProps) {
             <SidebarItem to={ROUTES.TENANTS} icon={Building2} label={t("nav.tenants")} collapsed={collapsed} />
           )}
           <SidebarItem to={ROUTES.PROVIDERS} icon={Cpu} label={t("nav.providers")} collapsed={collapsed} />
-          <SidebarItem to={ROUTES.CLI_CREDENTIALS} icon={KeyRound} label={t("nav.cliCredentials")} collapsed={collapsed} />
           <SidebarItem to={ROUTES.API_KEYS} icon={KeyRound} label={t("nav.apiKeys")} collapsed={collapsed} />
           <SidebarItem to={ROUTES.PACKAGES} icon={Blocks} label={t("nav.packages")} collapsed={collapsed} />
           {isOwner && (
@@ -135,12 +143,15 @@ export function Sidebar({ collapsed, onNavItemClick }: SidebarProps) {
           )}
           <SidebarItem to={ROUTES.APPROVALS} icon={ShieldCheck} label={t("nav.approvals")} collapsed={collapsed} />
           <SidebarItem to={ROUTES.IMPORT_EXPORT} icon={ArrowLeftRight} label={t("nav.importExport")} collapsed={collapsed} />
+          {isOwner && (
+            <SidebarItem to={ROUTES.BACKUP_RESTORE} icon={DatabaseBackup} label={t("nav.backupRestore")} collapsed={collapsed} />
+          )}
         </SidebarGroup>
         )}
       </nav>
 
       {/* Footer: connection status */}
-      <div className={cn("border-t py-3", collapsed ? "px-2 flex justify-center" : "px-4")}>
+      <div className={cn("shrink-0 overscroll-none border-t py-3", collapsed ? "px-2 flex justify-center" : "px-4")}>
         <ConnectionStatus collapsed={collapsed} />
       </div>
     </aside>

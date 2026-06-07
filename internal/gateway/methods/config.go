@@ -22,7 +22,7 @@ type ConfigMethods struct {
 	cfgPath      string
 	secretsStore store.ConfigSecretsStore
 	syncFn       func(ctx context.Context, cfg *config.Config) // nil-safe; syncs non-secret settings to system_configs
-	eventBus     bus.EventPublisher       // nil-safe; broadcasts config change events
+	eventBus     bus.EventPublisher                            // nil-safe; broadcasts config change events
 }
 
 func NewConfigMethods(cfg *config.Config, cfgPath string, secretsStore store.ConfigSecretsStore, eventBus bus.EventPublisher) *ConfigMethods {
@@ -36,10 +36,14 @@ func (m *ConfigMethods) SetSystemConfigSync(fn func(ctx context.Context, cfg *co
 }
 
 func (m *ConfigMethods) Register(router *gateway.MethodRouter) {
-	router.Register(protocol.MethodConfigGet, m.requireOwner(m.handleGet))
-	router.Register(protocol.MethodConfigApply, m.requireOwner(m.handleApply))
-	router.Register(protocol.MethodConfigPatch, m.requireOwner(m.handlePatch))
-	router.Register(protocol.MethodConfigSchema, m.requireOwner(m.handleSchema))
+	router.Register(protocol.MethodConfigGet, m.requireMasterScope(m.requireOwner(m.handleGet)))
+	router.Register(protocol.MethodConfigApply, m.requireMasterScope(m.requireOwner(m.handleApply)))
+	router.Register(protocol.MethodConfigPatch, m.requireMasterScope(m.requireOwner(m.handlePatch)))
+	router.Register(protocol.MethodConfigSchema, m.requireMasterScope(m.requireOwner(m.handleSchema)))
+	// config.defaults is read-only + secret-free (Go consts + agents.defaults overlay),
+	// so it only needs requireMasterScope — owner gating would spam auth errors for
+	// operators viewing agent detail pages.
+	router.Register(protocol.MethodConfigDefaults, m.requireMasterScope(m.handleDefaults))
 }
 
 // requireOwner wraps a handler to only allow owner-role users.
@@ -50,6 +54,31 @@ func (m *ConfigMethods) requireOwner(next gateway.MethodHandler) gateway.MethodH
 			client.SendResponse(protocol.NewErrorResponse(
 				req.ID, protocol.ErrUnauthorized,
 				i18n.T(locale, i18n.MsgPermissionDenied, req.Method),
+			))
+			return
+		}
+		next(ctx, client, req)
+	}
+}
+
+// requireMasterScope rejects config.* calls when the caller's ctx is scoped to
+// a non-master tenant. System owner callers (bypass-all) are allowed through.
+//
+// Background: config.* mutates the master in-memory *config.Config and the
+// on-disk config.json. A non-master tenant admin calling config.patch would
+// corrupt master state + leak master config to other tenants. This guard keeps
+// config.* strictly master-scoped until a tenant-aware refactor lands.
+//
+// Shares the predicate with store.IsMasterScope so HTTP and WS layers can't
+// drift — same rule, one source of truth.
+func (m *ConfigMethods) requireMasterScope(next gateway.MethodHandler) gateway.MethodHandler {
+	return func(ctx context.Context, client *gateway.Client, req *protocol.RequestFrame) {
+		if !store.IsMasterScope(ctx) {
+			locale := store.LocaleFromContext(ctx)
+			client.SendResponse(protocol.NewErrorResponse(
+				req.ID,
+				protocol.ErrUnauthorized,
+				i18n.T(locale, i18n.MsgConfigMasterScopeOnly),
 			))
 			return
 		}
@@ -239,6 +268,45 @@ func (m *ConfigMethods) handleSchema(_ context.Context, client *gateway.Client, 
 			"tools": map[string]any{
 				"type":        "object",
 				"description": "Tool configuration (browser, exec, web search)",
+			},
+			"skills": map[string]any{
+				"type":        "object",
+				"description": "Skill storage and upload settings",
+				"properties": map[string]any{
+					"max_upload_size_mb": map[string]any{
+						"type":        "integer",
+						"minimum":     config.MinSkillMaxUploadSizeMB,
+						"maximum":     config.MaxSkillMaxUploadSizeMB,
+						"default":     config.DefaultSkillMaxUploadSizeMB,
+						"description": "Maximum skill ZIP upload size in MB",
+					},
+					"slash_commands": map[string]any{
+						"type":        "object",
+						"description": "Explicit slash command skill activation settings",
+						"properties": map[string]any{
+							"enabled": map[string]any{
+								"type":        "boolean",
+								"default":     true,
+								"description": "Enable slash command detection in user prompts",
+							},
+							"suggest_not_found": map[string]any{
+								"type":        "boolean",
+								"default":     true,
+								"description": "Suggest similar skills when a requested skill is not found",
+							},
+							"partial_matching": map[string]any{
+								"type":        "boolean",
+								"default":     false,
+								"description": "Allow unique skill slug/name prefixes",
+							},
+							"prefix": map[string]any{
+								"type":        "string",
+								"default":     config.DefaultSkillSlashCommandPrefix,
+								"description": "Single-character slash command prefix",
+							},
+						},
+					},
+				},
 			},
 			"sessions": map[string]any{
 				"type":        "object",

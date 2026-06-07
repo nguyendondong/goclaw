@@ -1,9 +1,6 @@
 package http
 
 import (
-	"archive/zip"
-	"encoding/json"
-	"io"
 	"log/slog"
 	"net/http"
 
@@ -34,6 +31,25 @@ func (h *SkillsHandler) handleListAgentSkills(w http.ResponseWriter, r *http.Req
 	writeJSON(w, http.StatusOK, map[string]any{"skills": skills})
 }
 
+func (h *SkillsHandler) handleListAgentGrants(w http.ResponseWriter, r *http.Request) {
+	locale := store.LocaleFromContext(r.Context())
+	idStr := r.PathValue("id")
+	skillID, err := uuid.Parse(idStr)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": i18n.T(locale, i18n.MsgInvalidID, "skill")})
+		return
+	}
+
+	grants, err := h.skills.ListAgentGrantsForSkill(r.Context(), skillID)
+	if err != nil {
+		slog.Error("failed to list skill agent grants", "skill_id", skillID, "error", err)
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": i18n.T(locale, i18n.MsgFailedToList, "skill grants")})
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{"grants": grants})
+}
+
 func (h *SkillsHandler) handleGrantAgent(w http.ResponseWriter, r *http.Request) {
 	locale := store.LocaleFromContext(r.Context())
 	userID := store.UserIDFromContext(r.Context())
@@ -54,11 +70,11 @@ func (h *SkillsHandler) handleGrantAgent(w http.ResponseWriter, r *http.Request)
 	}
 
 	var req struct {
-		AgentID string `json:"agent_id"`
-		Version int    `json:"version"`
+		AgentID   string `json:"agent_id"`
+		Version   int    `json:"version"`
+		CanManage *bool  `json:"can_manage"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": i18n.T(locale, i18n.MsgInvalidJSON)})
+	if !bindJSON(w, r, locale, &req) {
 		return
 	}
 
@@ -72,13 +88,19 @@ func (h *SkillsHandler) handleGrantAgent(w http.ResponseWriter, r *http.Request)
 		req.Version = 1
 	}
 
-	if err := h.skills.GrantToAgent(r.Context(), skillID, agentID, req.Version, userID); err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+	var grantErr error
+	if req.CanManage == nil {
+		grantErr = h.skills.GrantToAgent(r.Context(), skillID, agentID, req.Version, userID)
+	} else {
+		grantErr = h.skills.GrantToAgent(r.Context(), skillID, agentID, req.Version, userID, *req.CanManage)
+	}
+	if grantErr != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": grantErr.Error()})
 		return
 	}
 
 	h.skills.BumpVersion()
-	h.emitCacheInvalidate(bus.CacheKindSkillGrants, "")
+	h.emitCacheInvalidate(bus.CacheKindSkillGrants, "", uuid.Nil)
 	emitAudit(h.msgBus, r, "skill.grant_changed", "skill", idStr)
 	writeJSON(w, http.StatusCreated, map[string]string{"ok": "true"})
 }
@@ -115,7 +137,7 @@ func (h *SkillsHandler) handleRevokeAgent(w http.ResponseWriter, r *http.Request
 	}
 
 	h.skills.BumpVersion()
-	h.emitCacheInvalidate(bus.CacheKindSkillGrants, "")
+	h.emitCacheInvalidate(bus.CacheKindSkillGrants, "", uuid.Nil)
 	emitAudit(h.msgBus, r, "skill.grant_changed", "skill", idStr)
 	writeJSON(w, http.StatusOK, map[string]string{"ok": "true"})
 }
@@ -142,8 +164,7 @@ func (h *SkillsHandler) handleGrantUser(w http.ResponseWriter, r *http.Request) 
 	var req struct {
 		UserID string `json:"user_id"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": i18n.T(locale, i18n.MsgInvalidJSON)})
+	if !bindJSON(w, r, locale, &req) {
 		return
 	}
 	if req.UserID == "" {
@@ -161,7 +182,7 @@ func (h *SkillsHandler) handleGrantUser(w http.ResponseWriter, r *http.Request) 
 	}
 
 	h.skills.BumpVersion()
-	h.emitCacheInvalidate(bus.CacheKindSkillGrants, "")
+	h.emitCacheInvalidate(bus.CacheKindSkillGrants, "", uuid.Nil)
 	emitAudit(h.msgBus, r, "skill.grant_changed", "skill", idStr)
 	writeJSON(w, http.StatusCreated, map[string]string{"ok": "true"})
 }
@@ -196,22 +217,9 @@ func (h *SkillsHandler) handleRevokeUser(w http.ResponseWriter, r *http.Request)
 	}
 
 	h.skills.BumpVersion()
-	h.emitCacheInvalidate(bus.CacheKindSkillGrants, "")
+	h.emitCacheInvalidate(bus.CacheKindSkillGrants, "", uuid.Nil)
 	emitAudit(h.msgBus, r, "skill.grant_changed", "skill", idStr)
 	writeJSON(w, http.StatusOK, map[string]string{"ok": "true"})
 }
 
 // --- Helpers ---
-
-func readZipFile(f *zip.File) (string, error) {
-	rc, err := f.Open()
-	if err != nil {
-		return "", err
-	}
-	defer rc.Close()
-	data, err := io.ReadAll(rc)
-	if err != nil {
-		return "", err
-	}
-	return string(data), nil
-}

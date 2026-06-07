@@ -8,7 +8,7 @@ import { BehaviorSessionsCard } from "./behavior-sessions-card";
 import { BehaviorSecurityCard } from "./behavior-security-card";
 import { BehaviorPendingCompactionCard, type PendingCompactionValues } from "./behavior-pending-compaction-card";
 
-/* eslint-disable @typescript-eslint/no-explicit-any */
+ 
 
 interface Props {
   config: Record<string, any>;
@@ -77,7 +77,7 @@ export function BehaviorSection({ config, onPatch, saving }: Props) {
     });
     setPendingCompaction(ch.pending_compaction ?? {});
     setDirty(false);
-  }, [config]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [config]);  
 
   const markDirty = <T,>(setter: React.Dispatch<React.SetStateAction<T>>) =>
     (v: T) => { setter(v); setDirty(true); };
@@ -85,7 +85,6 @@ export function BehaviorSection({ config, onPatch, saving }: Props) {
   const handleSave = () => {
     onPatch({
       gateway: {
-        ...gw,
         tool_status: ux.tool_status,
         block_reply: ux.block_reply,
         max_message_chars: rate.max_message_chars,
@@ -94,12 +93,11 @@ export function BehaviorSection({ config, onPatch, saving }: Props) {
         injection_action: security.injection_action,
       },
       agents: {
-        ...config.agents,
-        defaults: { ...ag, intent_classify: ux.intent_classify },
+        defaults: { intent_classify: ux.intent_classify },
       },
-      tools: { ...tl, scrub_credentials: security.scrub_credentials },
-      sessions: { ...ss, ...sessions },
-      channels: { ...ch, pending_compaction: pendingCompaction },
+      tools: { scrub_credentials: security.scrub_credentials },
+      sessions,
+      channels: { pending_compaction: pendingCompaction },
     });
   };
 

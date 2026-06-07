@@ -21,11 +21,11 @@ import (
 	"github.com/nextlevelbuilder/goclaw/internal/config"
 	httpapi "github.com/nextlevelbuilder/goclaw/internal/http"
 	mcpbridge "github.com/nextlevelbuilder/goclaw/internal/mcp"
-	"github.com/nextlevelbuilder/goclaw/internal/webui"
 	"github.com/nextlevelbuilder/goclaw/internal/permissions"
 	"github.com/nextlevelbuilder/goclaw/internal/providers"
 	"github.com/nextlevelbuilder/goclaw/internal/store"
 	"github.com/nextlevelbuilder/goclaw/internal/tools"
+	"github.com/nextlevelbuilder/goclaw/internal/webui"
 	"github.com/nextlevelbuilder/goclaw/pkg/protocol"
 )
 
@@ -50,25 +50,31 @@ type Server struct {
 	// Non-handler dependencies (don't implement RegisterRoutes)
 	policyEngine   *permissions.PolicyEngine
 	pairingService store.PairingStore
-	apiKeyStore    store.APIKeyStore  // for API key auth lookup
-	agentStore     store.AgentStore   // for context injection in tools_invoke
-	msgBus         *bus.MessageBus    // for MCP bridge media delivery
+	apiKeyStore    store.APIKeyStore // for API key auth lookup
+	agentStore     store.AgentStore  // for context injection in tools_invoke
+	msgBus         *bus.MessageBus   // for MCP bridge media delivery
 
 	upgrader    websocket.Upgrader
 	rateLimiter *RateLimiter
 	clients     map[string]*Client
 	mu          sync.RWMutex
 
-	startedAt      time.Time
-	version        string
-	db             interface{ PingContext(context.Context) error } // for health check DB ping
-	updateChecker  *UpdateChecker
+	startedAt     time.Time
+	version       string
+	db            interface{ PingContext(context.Context) error } // for health check DB ping
+	updateChecker *UpdateChecker
 
-	logTee   *LogTee                  // optional; auto-unsubscribes clients on disconnect
+	logTee   *LogTee                 // optional; auto-unsubscribes clients on disconnect
 	postTurn tools.PostTurnProcessor // optional; for team task dispatch in HTTP API paths
 
 	httpServer *http.Server
 	mux        *http.ServeMux
+
+	// publicURLSnapshot remembers the gateway's externally reachable base URL
+	// learned from inbound HTTP requests. Reset to a fresh snapshot per Server
+	// so test servers don't share state. Read by RPC methods that need to
+	// advertise URLs back to external systems (e.g. Bitrix24 install link).
+	publicURLSnapshot *PublicURLSnapshot
 }
 
 // SetPostTurnProcessor sets the post-turn processor for team task dispatch in HTTP API handlers.
@@ -79,12 +85,13 @@ func (s *Server) SetPostTurnProcessor(pt tools.PostTurnProcessor) {
 // NewServer creates a new gateway server.
 func NewServer(cfg *config.Config, eventPub bus.EventPublisher, agents *agent.Router, sess store.SessionStore, toolsReg ...*tools.Registry) *Server {
 	s := &Server{
-		cfg:       cfg,
-		eventPub:  eventPub,
-		agents:    agents,
-		sessions:  sess,
-		clients:   make(map[string]*Client),
-		startedAt: time.Now(),
+		cfg:               cfg,
+		eventPub:          eventPub,
+		agents:            agents,
+		sessions:          sess,
+		clients:           make(map[string]*Client),
+		startedAt:         time.Now(),
+		publicURLSnapshot: NewPublicURLSnapshot(),
 	}
 
 	s.upgrader = websocket.Upgrader{
@@ -109,6 +116,10 @@ func NewServer(cfg *config.Config, eventPub bus.EventPublisher, agents *agent.Ro
 
 // RateLimiter returns the server's rate limiter for use by method handlers.
 func (s *Server) RateLimiter() *RateLimiter { return s.rateLimiter }
+
+// PublicURLSnapshot returns the snapshot of the gateway's externally reachable
+// base URL. Updated by the snapshot middleware on every inbound request.
+func (s *Server) PublicURLSnapshot() *PublicURLSnapshot { return s.publicURLSnapshot }
 
 // checkOrigin validates WebSocket connection origin against the allowed origins whitelist.
 // If no origins are configured, all origins are allowed (backward compatibility / dev mode).
@@ -170,12 +181,19 @@ func (s *Server) BuildMux() *http.ServeMux {
 		mux.Handle("/v1/tools/invoke", toolsHandler)
 	}
 
+	// Read-only HTTP compatibility for automation clients.
+	if s.sessions != nil {
+		httpapi.NewSessionsHandler(s.sessions, s.cfg.Gateway.OwnerIDs).RegisterRoutes(mux)
+	}
+
 	// Register all HTTP API handlers (agents, skills, teams, storage, etc.)
 	for _, h := range s.handlers {
 		if h != nil {
 			h.RegisterRoutes(mux)
 		}
 	}
+
+	httpapi.RegisterAPINotFoundRoute(mux)
 
 	// MCP bridge: expose GoClaw tools to Claude CLI via streamable-http.
 	// Only listens on localhost (CLI runs on the same machine).
@@ -185,7 +203,7 @@ func (s *Server) BuildMux() *http.ServeMux {
 		if s.cfg.Gateway.Token != "" {
 			bridgeHandler := mcpbridge.NewBridgeServer(s.tools, "1.0.0", s.msgBus)
 			handler := tokenAuthMiddleware(s.cfg.Gateway.Token,
-				bridgeContextMiddleware(s.cfg.Gateway.Token, bridgeHandler))
+				bridgeContextMiddleware(s.cfg.Gateway.Token, s.agentStore, bridgeHandler))
 			mux.Handle("/mcp/bridge", handler)
 		} else {
 			slog.Warn("security.mcp_bridge_disabled: no gateway token configured, MCP bridge is disabled")
@@ -198,9 +216,17 @@ func (s *Server) BuildMux() *http.ServeMux {
 	}
 
 	// Embedded web UI (built with -tags embedui). Catch-all after all API routes.
+	// When the build does NOT include the embedui tag, webui.Handler() returns nil
+	// and there's no handler for "/" — http.ServeMux would then return an opaque
+	// 404 for the root URL, confusing operators who open the deployed URL in a
+	// browser to check the service. Install a minimal JSON index handler in that
+	// case so the root responds with something useful (and any unmatched path
+	// still returns 404, just with a JSON body).
 	if h := webui.Handler(); h != nil {
 		mux.Handle("/", h)
 		slog.Info("serving embedded web UI")
+	} else {
+		mux.HandleFunc("/", s.handleIndex)
 	}
 
 	s.mux = mux
@@ -212,7 +238,7 @@ func (s *Server) BuildMux() *http.ServeMux {
 // access agent/user scope and resolve workspace-relative paths.
 // When a gateway token is configured, the context headers must be accompanied by
 // a valid X-Bridge-Sig HMAC to prevent forgery.
-func bridgeContextMiddleware(gatewayToken string, next http.Handler) http.Handler {
+func bridgeContextMiddleware(gatewayToken string, agentStore store.AgentStore, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		ctx := r.Context()
 		agentIDStr := r.Header.Get("X-Agent-ID")
@@ -221,6 +247,8 @@ func bridgeContextMiddleware(gatewayToken string, next http.Handler) http.Handle
 		chatID := r.Header.Get("X-Chat-ID")
 		peerKind := r.Header.Get("X-Peer-Kind")
 		workspace := r.Header.Get("X-Workspace")
+		localKey := r.Header.Get("X-Local-Key")
+		sessionKey := r.Header.Get("X-Session-Key")
 
 		if agentIDStr != "" || userID != "" {
 			// Reject context headers when no gateway token — prevents unauthenticated impersonation.
@@ -234,7 +262,7 @@ func bridgeContextMiddleware(gatewayToken string, next http.Handler) http.Handle
 			// Verify HMAC signature over all context fields.
 			tenantIDStr := r.Header.Get("X-Tenant-ID")
 			sig := r.Header.Get("X-Bridge-Sig")
-			ok, tenantVerified := providers.VerifyBridgeContext(gatewayToken, agentIDStr, userID, channel, chatID, peerKind, workspace, tenantIDStr, sig)
+			ok, tenantVerified := providers.VerifyBridgeContext(gatewayToken, agentIDStr, userID, channel, chatID, peerKind, workspace, tenantIDStr, sig, localKey, sessionKey)
 			if !ok {
 				slog.Warn("security.mcp_bridge: invalid bridge context signature",
 					"agent_id", agentIDStr, "user_id", userID)
@@ -245,6 +273,18 @@ func bridgeContextMiddleware(gatewayToken string, next http.Handler) http.Handle
 			if agentIDStr != "" {
 				if id, err := uuid.Parse(agentIDStr); err == nil {
 					ctx = store.WithAgentID(ctx, id)
+
+					// Inject per-agent shell deny group overrides so the exec tool
+					// respects the same policy as the normal agent loop.
+					if agentStore != nil {
+						ag, err := agentStore.GetByIDUnscoped(ctx, id)
+						if err == nil && ag != nil {
+							groups := ag.ParseShellDenyGroups()
+							if groups != nil {
+								ctx = store.WithShellDenyGroups(ctx, groups)
+							}
+						}
+					}
 				}
 			}
 			if userID != "" {
@@ -274,6 +314,15 @@ func bridgeContextMiddleware(gatewayToken string, next http.Handler) http.Handle
 		if workspace != "" && (agentIDStr != "" || userID != "") {
 			ctx = tools.WithToolWorkspace(ctx, workspace)
 		}
+		// Routing context (localKey, sessionKey) is injected unconditionally like channel/chatID.
+		// These are used for message routing (forum topics), not security-sensitive operations.
+		// Without valid agent context, tool execution will fail anyway.
+		if localKey != "" {
+			ctx = tools.WithToolLocalKey(ctx, localKey)
+		}
+		if sessionKey != "" {
+			ctx = tools.WithToolSessionKey(ctx, sessionKey)
+		}
 
 		next.ServeHTTP(w, r.WithContext(ctx))
 	})
@@ -301,6 +350,13 @@ func (s *Server) Start(ctx context.Context) error {
 	if os.Getenv("GOCLAW_DESKTOP") == "1" {
 		handler = desktopCORS(mux)
 	}
+	// NOTE: The public-URL snapshot is intentionally NOT updated by a global
+	// middleware. An unauthenticated probe with a forged Host header could
+	// otherwise poison the URL we hand back to clients (which then ends up
+	// in OAuth callbacks and would leak tokens to an attacker-controlled
+	// host). Instead, the snapshot is updated inside handleConnect AFTER
+	// token authentication succeeds (see internal/gateway/router.go), and
+	// from /bitrix24/install (already gated by valid OAuth state).
 
 	addr := fmt.Sprintf("%s:%d", s.cfg.Gateway.Host, s.cfg.Gateway.Port)
 	s.httpServer = &http.Server{
@@ -332,6 +388,11 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	}
 
 	client := NewClient(conn, s, clientIP(r))
+	// Capture the public URL from the HTTP upgrade request. We DON'T snapshot
+	// it server-wide yet — that happens only after the client authenticates
+	// in handleConnect. This prevents an unauthenticated probe with a forged
+	// Host header from poisoning the gateway-wide public URL.
+	client.setUpgradeURL(derivePublicURLFromRequest(r))
 	s.registerClient(client)
 
 	defer func() {
@@ -347,6 +408,24 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
 	fmt.Fprintf(w, `{"status":"ok","protocol":%d}`, protocol.ProtocolVersion)
+}
+
+// handleIndex is the fallback "/" handler when no embedded web UI is present.
+// It returns a small JSON service-info document for exact-match "/" requests
+// and a JSON 404 for everything else — http.ServeMux routes "/" as a
+// catch-all, so unrelated paths fall through here too.
+func (s *Server) handleIndex(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	if r.URL.Path != "/" {
+		w.WriteHeader(http.StatusNotFound)
+		_, _ = w.Write([]byte(`{"error":"not found"}`))
+		return
+	}
+	w.WriteHeader(http.StatusOK)
+	fmt.Fprintf(w,
+		`{"service":"goclaw","status":"ok","protocol":%d,`+
+			`"endpoints":["/health","/v1/chat/completions","/v1/responses","/v1/tools/invoke","/ws"]}`,
+		protocol.ProtocolVersion)
 }
 
 // clientIP extracts the real client IP from the request, checking proxy headers first.
@@ -436,8 +515,18 @@ func (s *Server) SetSecureCLIGrantHandler(h *httpapi.SecureCLIGrantHandler) {
 	s.handlers = append(s.handlers, h)
 }
 
+// SetBrowserCookiesHandler sets the selected browser-cookie sync handler.
+func (s *Server) SetBrowserCookiesHandler(h *httpapi.BrowserCookiesHandler) {
+	s.handlers = append(s.handlers, h)
+}
+
 // SetPackagesHandler sets the runtime package management handler.
 func (s *Server) SetPackagesHandler(h *httpapi.PackagesHandler) {
+	s.handlers = append(s.handlers, h)
+}
+
+// SetGatewayUpgradeHandler sets the host-local gateway upgrade trigger handler.
+func (s *Server) SetGatewayUpgradeHandler(h *httpapi.GatewayUpgradeHandler) {
 	s.handlers = append(s.handlers, h)
 }
 
@@ -446,6 +535,24 @@ func (s *Server) SetOAuthHandler(h *httpapi.OAuthHandler) { s.handlers = append(
 
 // SetAPIKeysHandler sets the API key management handler.
 func (s *Server) SetAPIKeysHandler(h *httpapi.APIKeysHandler) {
+	s.handlers = append(s.handlers, h)
+}
+
+// SetWebhooksAdminHandler registers the webhook admin CRUD handler.
+func (s *Server) SetWebhooksAdminHandler(h *httpapi.WebhooksAdminHandler) {
+	s.handlers = append(s.handlers, h)
+}
+
+// SetWebhookMessageHandler registers the POST /v1/webhooks/message runtime handler.
+// Only called when edition.Current().AllowsChannels() is true (Standard edition).
+func (s *Server) SetWebhookMessageHandler(h *httpapi.WebhookMessageHandler) {
+	s.handlers = append(s.handlers, h)
+}
+
+// SetWebhookLLMHandler registers the POST /v1/webhooks/llm runtime handler.
+// Available in all editions (Standard + Lite). Localhost-only enforcement is
+// handled by WebhookAuthMiddleware at request time via webhook.LocalhostOnly.
+func (s *Server) SetWebhookLLMHandler(h *httpapi.WebhookLLMHandler) {
 	s.handlers = append(s.handlers, h)
 }
 
@@ -481,8 +588,46 @@ func (s *Server) SetKnowledgeGraphHandler(h *httpapi.KnowledgeGraphHandler) {
 	s.handlers = append(s.handlers, h)
 }
 
+// SetEvolutionHandler sets the evolution metrics + suggestions handler.
+func (s *Server) SetEvolutionHandler(h *httpapi.EvolutionHandler) {
+	s.handlers = append(s.handlers, h)
+}
+
+// SetVoicesHandler sets the ElevenLabs voices list + refresh handler.
+func (s *Server) SetVoicesHandler(h *httpapi.VoicesHandler) { s.handlers = append(s.handlers, h) }
+
+// SetTTSHandler sets the TTS synthesize handler.
+func (s *Server) SetTTSHandler(h *httpapi.TTSHandler) { s.handlers = append(s.handlers, h) }
+
+// SetTTSConfigHandler sets the per-tenant TTS config handler.
+func (s *Server) SetTTSConfigHandler(h *httpapi.TTSConfigHandler) { s.handlers = append(s.handlers, h) }
+
+// SetVaultHandler sets the Knowledge Vault document handler.
+func (s *Server) SetVaultHandler(h *httpapi.VaultHandler) { s.handlers = append(s.handlers, h) }
+
+// SetVaultGraphHandler sets the lightweight graph visualization handler.
+func (s *Server) SetVaultGraphHandler(h *httpapi.VaultGraphHandler) {
+	s.handlers = append(s.handlers, h)
+}
+
+// SetEpisodicHandler sets the episodic memory handler.
+func (s *Server) SetEpisodicHandler(h *httpapi.EpisodicHandler) { s.handlers = append(s.handlers, h) }
+
+// SetOrchestrationHandler sets the orchestration mode handler.
+func (s *Server) SetOrchestrationHandler(h *httpapi.OrchestrationHandler) {
+	s.handlers = append(s.handlers, h)
+}
+
+// SetV3FlagsHandler sets the per-agent v3 feature flag handler.
+func (s *Server) SetV3FlagsHandler(h *httpapi.V3FlagsHandler) { s.handlers = append(s.handlers, h) }
+
 // SetActivityHandler sets the activity audit log handler.
 func (s *Server) SetActivityHandler(h *httpapi.ActivityHandler) {
+	s.handlers = append(s.handlers, h)
+}
+
+// SetRuntimeLogsHandler sets the runtime log aggregate handler.
+func (s *Server) SetRuntimeLogsHandler(h *httpapi.RuntimeLogsHandler) {
 	s.handlers = append(s.handlers, h)
 }
 
@@ -493,6 +638,25 @@ func (s *Server) SetSystemConfigsHandler(h *httpapi.SystemConfigsHandler) {
 
 // SetUsageHandler sets the usage analytics handler.
 func (s *Server) SetUsageHandler(h *httpapi.UsageHandler) { s.handlers = append(s.handlers, h) }
+
+// SetUsageCapsHandler sets usage cap and model pricing handlers.
+func (s *Server) SetUsageCapsHandler(h *httpapi.UsageCapsHandler) {
+	s.handlers = append(s.handlers, h)
+}
+
+// SetBackupHandler sets the system backup handler.
+func (s *Server) SetBackupHandler(h *httpapi.BackupHandler) { s.handlers = append(s.handlers, h) }
+
+// SetRestoreHandler sets the system restore handler.
+func (s *Server) SetRestoreHandler(h *httpapi.RestoreHandler) { s.handlers = append(s.handlers, h) }
+
+// SetBackupS3Handler sets the S3 backup integration handler.
+func (s *Server) SetBackupS3Handler(h *httpapi.BackupS3Handler) { s.handlers = append(s.handlers, h) }
+
+// SetTenantBackupHandler sets the tenant-scoped backup/restore handler.
+func (s *Server) SetTenantBackupHandler(h *httpapi.TenantBackupHandler) {
+	s.handlers = append(s.handlers, h)
+}
 
 // SetDocsHandler sets the OpenAPI spec + Swagger UI handler.
 func (s *Server) SetDocsHandler(h *httpapi.DocsHandler) { s.handlers = append(s.handlers, h) }
@@ -505,6 +669,11 @@ func (s *Server) SetAgentStore(as store.AgentStore) { s.agentStore = as }
 
 // SetMessageBus sets the message bus for MCP bridge media delivery.
 func (s *Server) SetMessageBus(mb *bus.MessageBus) { s.msgBus = mb }
+
+// SetWorkstationsHandler sets the workstations CRUD handler (Standard edition only).
+func (s *Server) SetWorkstationsHandler(h *httpapi.WorkstationsHandler) {
+	s.handlers = append(s.handlers, h)
+}
 
 // SetVersion sets the server version for health responses.
 func (s *Server) SetVersion(v string) { s.version = v }

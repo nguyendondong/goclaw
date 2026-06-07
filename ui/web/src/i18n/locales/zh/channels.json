@@ -213,7 +213,6 @@
     "encrypt_key": { "label": "加密密钥", "help": "用于Webhook模式" },
     "verification_token": { "label": "验证Token", "help": "用于Webhook模式" },
     "webhook_secret": { "label": "Webhook Secret" },
-    "bridge_url": { "label": "Bridge URL" },
     "api_server": { "label": "API 服务器 URL", "help": "自定义 Telegram Bot API 服务器用于大文件上传（最大 2GB）。留空使用默认服务器。" },
     "proxy": { "label": "HTTP 代理", "help": "通过 HTTP 代理路由Bot流量" },
     "dm_policy": { "label": "私聊策略" },
@@ -244,7 +243,17 @@
     "thread_ttl": { "label": "线程参与 TTL（小时）", "help": "Bot 停止自动回复已参与线程的小时数。0 = 始终需要 @提及。" },
     "skills": { "label": "Skill过滤", "help": "限制此群组可用的Skill" },
     "tools": { "label": "工具白名单", "help": "限制Agent在此群组中可使用的工具" },
-    "system_prompt": { "label": "系统提示词" }
+    "system_prompt": { "label": "系统提示词" },
+    "platform": { "label": "平台", "help": "选择此 Pancake 页面所服务的平台。" },
+    "tiktok_type": { "label": "TikTok 类型", "help": "选择此页面的 TikTok 账户类型" },
+    "features.private_reply": {
+      "label": "私信回复（评论 → 私信）",
+      "help": "在公开回复后向评论者发送一次性私信。仅支持 Facebook/Instagram，Meta 允许在评论后 7 天内发送。"
+    },
+    "private_reply_message": {
+      "label": "私信内容",
+      "help": "支持 commenter_name 和 post_title 占位符。留空使用英文默认文本。"
+    }
   },
   "fieldOptions": {
     "block_reply": {
@@ -289,6 +298,19 @@
       "auto": "自动",
       "raw": "原始",
       "card": "卡片"
+    },
+    "platform": {
+      "facebook":    "Facebook",
+      "instagram":   "Instagram",
+      "threads":     "Threads (测试版)",
+      "tiktok":      "TikTok",
+      "youtube":     "YouTube (测试版)",
+      "shopee":      "Shopee",
+      "line":        "Line",
+      "google":      "Google",
+      "chat_plugin": "Chat Plugin",
+      "lazada":      "Lazada",
+      "tokopedia":   "Tokopedia"
     }
   },
   "groupOverrides": {
@@ -331,6 +353,10 @@
     "zaloPersonal": {
       "createLabel": "创建并认证",
       "formBanner": "创建后，您将通过二维码进行认证并配置允许的用户。"
+    },
+    "whatsapp": {
+      "createLabel": "创建并扫码",
+      "formBanner": "创建后，请用 WhatsApp 扫描二维码完成认证。"
     }
   },
   "fallback": {
@@ -379,5 +405,71 @@
     "retry": "重试",
     "close": "关闭",
     "skip": "跳过"
+  },
+  "whatsapp": {
+    "loginSuccessLoading": "✅ WhatsApp 已连接！正在加载 channel...",
+    "waitingForQr": "正在等待二维码...",
+    "scanHint": "打开 WhatsApp → 点击【您】→【已连接的设备】→【连接设备】",
+    "initializing": "初始化中...",
+    "skip": "跳过",
+    "retry": "重试",
+    "close": "关闭",
+    "reauthTitle": "连接 WhatsApp — {{name}}",
+    "reauthDescription": "使用 WhatsApp 扫描二维码以连接设备。",
+    "alreadyLinked": "✅ 设备已连接",
+    "alreadyLinkedDetail": "WhatsApp 已连接。如需连接其他设备，请点击【重新连接】——这将退出当前会话。",
+    "relinkDevice": "重新连接",
+    "connectedSuccess": "✅ WhatsApp 连接成功！",
+    "tabQrCode": "二维码"
+  },
+  "bitrix24": {
+    "portalSelect": {
+      "placeholder": "选择门户...",
+      "empty": "尚未连接 Bitrix24 门户。",
+      "createFirst": "连接第一个 Bitrix24 门户",
+      "createNew": "创建新门户",
+      "pendingBadge": "等待授权 — 点击继续",
+      "loadError": "门户加载失败，请刷新重试。"
+    },
+    "errors": {
+      "portalRequired": "请选择一个门户。",
+      "portalNotInstalled": "此门户尚未完成授权。请先授权再创建通道。"
+    },
+    "create": {
+      "title": "连接 Bitrix24 门户",
+      "submit": "创建并授权 →",
+      "fields": {
+        "name": "门户名称",
+        "nameHint": "内部标识。从域名自动填充，可编辑。",
+        "domain": "域名",
+        "clientId": "Client ID",
+        "clientSecret": "Client Secret"
+      },
+      "errors": {
+        "invalidName": "请使用小写字母、数字、连字符、下划线（2-64 字符）。",
+        "invalidDomain": "必须是有效的 Bitrix24 域名（例如：mycorp.bitrix24.com）。",
+        "duplicateName": "门户名称已存在。",
+        "forbidden": "您需要租户管理员权限才能创建门户。",
+        "gatewayURLUnknown": "请先通过公网 URL（非 localhost）打开 goclaw UI 然后重试。"
+      },
+      "help": {
+        "title": "如何获取 Client ID 和 Secret？",
+        "step1": "以管理员身份打开 Bitrix24 门户。",
+        "step2": "进入开发者资源 → 其他 → 本地应用 → 添加。",
+        "step3": "将 Handler URL 设置为：",
+        "step4": "勾选所需的权限：",
+        "step5": "保存 → 将 Application ID 和 Key 复制到上面的表单。",
+        "localDevWarning": "您正在 localhost — Bitrix24 无法访问此 URL。请先使用 Cloudflare Tunnel 或公网域名。"
+      },
+      "authorize": {
+        "title": "授权 \"{{name}}\"",
+        "openButton": "打开授权页面",
+        "waiting": "等待授权中...",
+        "installed": "门户安装成功！",
+        "timedOut": "尚未完成授权。可从下拉框继续。",
+        "closeResumeLater": "关闭（稍后继续）",
+        "urlUnknown": "无法获取安装 URL。请通过公网 URL 打开 goclaw UI 后从下拉框重试。"
+      }
+    }
   }
 }

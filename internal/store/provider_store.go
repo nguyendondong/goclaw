@@ -24,7 +24,6 @@ const (
 	ProviderBailian         = "bailian"
 	ProviderChatGPTOAuth    = "chatgpt_oauth"
 	ProviderClaudeCLI       = "claude_cli"
-	ProviderSuno            = "suno"
 	ProviderYesScale        = "yescale"
 	ProviderZai             = "zai"
 	ProviderZaiCoding       = "zai_coding"
@@ -34,6 +33,7 @@ const (
 	ProviderNovita          = "novita"          // Novita AI (OpenAI-compatible endpoint)
 	ProviderBytePlus        = "byteplus"        // BytePlus ModelArk (Seed 2.0 models)
 	ProviderBytePlusCoding  = "byteplus_coding" // BytePlus ModelArk Coding Plan
+	ProviderVertex          = "vertex"          // Google Cloud Vertex AI (OAuth2 service account + ADC)
 
 	// Novita AI defaults.
 	NovitaDefaultAPIBase = "https://api.novita.ai/openai"
@@ -43,7 +43,12 @@ const (
 	BytePlusDefaultAPIBase       = "https://ark.ap-southeast.bytepluses.com/api/v3"
 	BytePlusCodingDefaultAPIBase = "https://ark.ap-southeast.bytepluses.com/api/coding/v3"
 	BytePlusDefaultModel         = "seed-2-0-lite-260228"
+
 )
+
+// Vertex AI constants live in internal/providers/vertex.go to avoid a store→providers import cycle
+// (store is imported by providers). DB-layer concerns (ProviderVertex type + settings parsing)
+// remain in this package.
 
 // ValidProviderTypes lists all accepted provider_type values.
 var ValidProviderTypes = map[string]bool{
@@ -62,7 +67,6 @@ var ValidProviderTypes = map[string]bool{
 	ProviderBailian:         true,
 	ProviderChatGPTOAuth:    true,
 	ProviderClaudeCLI:       true,
-	ProviderSuno:            true,
 	ProviderYesScale:        true,
 	ProviderZai:             true,
 	ProviderZaiCoding:       true,
@@ -72,19 +76,43 @@ var ValidProviderTypes = map[string]bool{
 	ProviderNovita:          true,
 	ProviderBytePlus:        true,
 	ProviderBytePlusCoding:  true,
+	ProviderVertex:          true,
+}
+
+// VertexProviderSettings holds Vertex-specific config stored in llm_providers.settings JSONB.
+type VertexProviderSettings struct {
+	ProjectID string `json:"project_id"`
+	Region    string `json:"region"`
+	Model     string `json:"model,omitempty"` // optional default model override (e.g. "google/gemini-2.5-pro-001")
+}
+
+// ParseVertexProviderSettings extracts Vertex config from settings JSONB.
+// Returns nil if project_id or region is missing (both required).
+func ParseVertexProviderSettings(settings json.RawMessage) *VertexProviderSettings {
+	if len(settings) == 0 {
+		return nil
+	}
+	var s VertexProviderSettings
+	if json.Unmarshal(settings, &s) != nil {
+		return nil
+	}
+	if s.ProjectID == "" || s.Region == "" {
+		return nil
+	}
+	return &s
 }
 
 // LLMProviderData represents an LLM provider configuration.
 type LLMProviderData struct {
 	BaseModel
-	TenantID     uuid.UUID       `json:"tenant_id,omitempty"`
-	Name         string          `json:"name"`
-	DisplayName  string          `json:"display_name,omitempty"`
-	ProviderType string          `json:"provider_type"`
-	APIBase      string          `json:"api_base,omitempty"`
-	APIKey       string          `json:"api_key,omitempty"`
-	Enabled      bool            `json:"enabled"`
-	Settings     json.RawMessage `json:"settings,omitempty"`
+	TenantID     uuid.UUID       `json:"tenant_id,omitempty" db:"tenant_id"`
+	Name         string          `json:"name" db:"name"`
+	DisplayName  string          `json:"display_name,omitempty" db:"display_name"`
+	ProviderType string          `json:"provider_type" db:"provider_type"`
+	APIBase      string          `json:"api_base,omitempty" db:"api_base"`
+	APIKey       string          `json:"api_key,omitempty" db:"api_key"`
+	Enabled      bool            `json:"enabled" db:"enabled"`
+	Settings     json.RawMessage `json:"settings,omitempty" db:"settings"`
 }
 
 // RequiredMemoryEmbeddingDimensions is the fixed vector size used by the pgvector memory schema.
@@ -93,22 +121,22 @@ const RequiredMemoryEmbeddingDimensions = 1536
 
 // EmbeddingSettings holds embedding-specific configuration stored in provider settings JSONB.
 type EmbeddingSettings struct {
-	Enabled    bool   `json:"enabled"`
-	Model      string `json:"model,omitempty"`      // e.g. "text-embedding-3-small"
-	APIBase    string `json:"api_base,omitempty"`   // override if embedding endpoint differs from chat
-	Dimensions int    `json:"dimensions,omitempty"` // truncate output to N dims (e.g. 1536); 0 = model default
+	Enabled    bool   `json:"enabled" db:"-"`
+	Model      string `json:"model,omitempty" db:"-"`      // e.g. "text-embedding-3-small"
+	APIBase    string `json:"api_base,omitempty" db:"-"`   // override if embedding endpoint differs from chat
+	Dimensions int    `json:"dimensions,omitempty" db:"-"` // truncate output to N dims (e.g. 1536); 0 = model default
 }
 
 // ProviderReasoningConfig holds provider-owned default reasoning settings.
 // These defaults are inherited by agents unless they save a custom override.
 type ProviderReasoningConfig struct {
-	Effort   string `json:"effort,omitempty"`
-	Fallback string `json:"fallback,omitempty"`
+	Effort   string `json:"effort,omitempty" db:"-"`
+	Fallback string `json:"fallback,omitempty" db:"-"`
 }
 
 // ChatGPTOAuthProviderSettings holds provider-level defaults for Codex account pooling.
 type ChatGPTOAuthProviderSettings struct {
-	CodexPool *ChatGPTOAuthRoutingConfig `json:"codex_pool,omitempty"`
+	CodexPool *ChatGPTOAuthRoutingConfig `json:"codex_pool,omitempty" db:"-"`
 }
 
 // ParseEmbeddingSettings extracts embedding config from a provider's settings JSONB.
@@ -181,7 +209,7 @@ var NoEmbeddingTypes = map[string]bool{
 	ProviderACP:             true,
 	ProviderClaudeCLI:       true,
 	ProviderChatGPTOAuth:    true,
-	ProviderSuno:            true,
+	ProviderVertex:          true, // Vertex embeddings live on a different native endpoint, not on /endpoints/openapi
 }
 
 // ProviderStore manages LLM providers.

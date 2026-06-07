@@ -10,10 +10,12 @@ export interface FieldDef {
   defaultValue?: string | number | boolean | string[];
   options?: { value: string; label: string }[];
   help?: string;
-  /** Only show this field when another field has a specific value */
-  showWhen?: { key: string; value: string };
+  /** Only show this field when another field has a specific value (or one of several values) */
+  showWhen?: { key: string; value: string | string[] };
   /** Disable this field when another field has a specific value */
   disabledWhen?: { key: string; value: string; hint?: string };
+  /** Hide in an "Advanced" collapsible section — for rarely-needed fields */
+  advanced?: boolean;
 }
 
 // --- Shared option lists ---
@@ -68,10 +70,44 @@ export const credentialsSchema: Record<string, FieldDef[]> = {
     { key: "webhook_secret", label: "Webhook Secret", type: "password" },
   ],
   zalo_personal: [],
-  whatsapp: [
-    { key: "bridge_url", label: "Bridge URL", type: "text", required: true, placeholder: "http://bridge:3000" },
+  whatsapp: [],
+  facebook: [
+    { key: "page_access_token", label: "Page Access Token", type: "password", required: true, help: "From Facebook Developer Console → Your App → Messenger → Page Access Token" },
+    { key: "app_secret", label: "App Secret", type: "password", required: true, help: "From Facebook Developer Console → Your App → Settings → Basic" },
+    { key: "verify_token", label: "Webhook Verify Token", type: "password", required: true, help: "A secret string you choose, used to verify the webhook URL" },
   ],
+  pancake: [
+    { key: "api_key", label: "API Key", type: "password", required: true, help: "Pancake user-level API key from pages.fm account settings" },
+    { key: "page_access_token", label: "Page Access Token", type: "password", required: true, help: "Page-level token from Pancake dashboard → Page Settings" },
+    { key: "webhook_secret", label: "Webhook Secret (Optional)", type: "password", help: "HMAC-SHA256 secret for webhook signature verification. Leave empty to skip verification." },
+  ],
+  // Bitrix24 credentials are empty: portal-level OAuth (client_id/client_secret/tokens)
+  // lives on the bitrix_portals row, not the channel instance. Authorize the portal
+  // once via /bitrix24/install, then create channel instances against that portal.
+  bitrix24: [],
 };
+
+// --- Pancake platform options ---
+
+const pancakePlatformOptions = [
+  { value: "facebook",    label: "Facebook" },
+  { value: "instagram",   label: "Instagram" },
+  { value: "threads",     label: "Threads (Beta)" },
+  { value: "tiktok",      label: "TikTok" },
+  { value: "youtube",     label: "YouTube (Beta)" },
+  { value: "shopee",      label: "Shopee" },
+  { value: "line",        label: "Line" },
+  { value: "google",      label: "Google" },
+  { value: "chat_plugin", label: "Chat Plugin" },
+  { value: "lazada",      label: "Lazada" },
+  { value: "tokopedia",   label: "Tokopedia" },
+];
+
+const tiktokTypeOptions = [
+  { value: "livestream", label: "Livestream AIO" },
+  { value: "messaging",  label: "Business Messaging" },
+  { value: "shop",       label: "TikTok Shop" },
+];
 
 // --- Config schemas ---
 
@@ -151,8 +187,81 @@ export const configSchema: Record<string, FieldDef[]> = {
   whatsapp: [
     { key: "dm_policy", label: "DM Policy", type: "select", options: dmPolicyOptions, defaultValue: "pairing" },
     { key: "group_policy", label: "Group Policy", type: "select", options: groupPolicyOptions, defaultValue: "pairing" },
+    { key: "require_mention", label: "Require @Mention in Groups", type: "boolean", help: "Only respond in group chats when the bot is explicitly @mentioned" },
     { key: "allow_from", label: "Allowed Users", type: "tags", help: "WhatsApp user IDs" },
     { key: "block_reply", label: "Block Reply", type: "select", options: blockReplyOptions, defaultValue: "inherit", help: "Deliver intermediate text during tool iterations" },
+  ],
+  facebook: [
+    { key: "page_id", label: "Page ID", type: "text", required: true, help: "Facebook Page numeric ID" },
+    { key: "features.comment_reply", label: "Comment Auto-Reply", type: "boolean", defaultValue: false },
+    { key: "features.messenger_auto_reply", label: "Messenger Auto-Reply", type: "boolean", defaultValue: false },
+    { key: "features.first_inbox", label: "First Inbox DM", type: "boolean", defaultValue: false, help: "Send a one-time DM to commenters after their first comment reply" },
+    { key: "comment_reply_options.include_post_context", label: "Include Post Context", type: "boolean", defaultValue: false, help: "Fetch original post content for comment context" },
+    { key: "comment_reply_options.max_thread_depth", label: "Max Thread Depth", type: "number", defaultValue: 10 },
+    { key: "messenger_options.session_timeout", label: "Messenger Session Timeout", type: "text", placeholder: "e.g. 30m" },
+    { key: "post_context_cache_ttl", label: "Post Cache TTL", type: "text", placeholder: "e.g. 15m" },
+    { key: "first_inbox_message", label: "First Inbox DM Text", type: "textarea", help: "Custom DM sent to first-time commenters. Defaults to Vietnamese if empty." },
+    { key: "allow_from", label: "Allowed Users", type: "tags", help: "Facebook user IDs" },
+    { key: "block_reply", label: "Block Reply", type: "select", options: blockReplyOptions, defaultValue: "inherit" },
+  ],
+  pancake: [
+    { key: "page_id", label: "Page ID", type: "text", required: true, help: "Pancake internal page ID (numeric, from Pancake dashboard)" },
+    { key: "webhook_page_id", label: "Webhook Page ID", type: "text", help: "Only needed when the native platform page ID in webhooks differs from the Pancake page ID above (rare). Leave empty if both are the same.", advanced: true },
+    { key: "platform", label: "Platform", type: "select", required: true, defaultValue: "", options: pancakePlatformOptions, help: "Select the platform this Pancake page serves." },
+    { key: "tiktok_type", label: "TikTok Type", type: "select", options: tiktokTypeOptions, showWhen: { key: "platform", value: "tiktok" }, help: "Select the TikTok account type for this page" },
+    { key: "features.inbox_reply", label: "Inbox Auto-Reply", type: "boolean", defaultValue: true },
+    { key: "features.comment_reply", label: "Comment Reply", type: "boolean", defaultValue: false,
+      showWhen: { key: "platform", value: ["facebook", "instagram", "threads", "tiktok", "youtube"] } },
+    { key: "features.private_reply", label: "Private Reply (Comment → DM)", type: "boolean", defaultValue: false,
+      help: "Send a one-time DM to commenters after the public reply. Facebook/Instagram only. Meta allows DM within 7 days of the comment.",
+      showWhen: { key: "platform", value: ["facebook", "instagram"] } },
+    { key: "private_reply_message", label: "DM Message", type: "textarea",
+      help: "Supports {{commenter_name}} and {{post_title}}. Empty = default English text.",
+      placeholder: "Hi {{commenter_name}}! Thanks for commenting on \"{{post_title}}\". How can I help?",
+      showWhen: { key: "features.private_reply", value: "true" } },
+    { key: "features.auto_react", label: "Auto-React (Like) Comments", type: "boolean",
+      defaultValue: false,
+      showWhen: { key: "platform", value: "facebook" },
+      help: "Automatically like Facebook comments. Set webhook_secret for security." },
+    { key: "auto_react_options.allow_post_ids", label: "Auto-React: Allow Post IDs", type: "tags",
+      showWhen: { key: "features.auto_react", value: "true" },
+      help: "Only react on these post IDs. Empty = all posts. Deny list overrides." },
+    { key: "auto_react_options.deny_post_ids", label: "Auto-React: Deny Post IDs", type: "tags",
+      showWhen: { key: "features.auto_react", value: "true" },
+      help: "Never react on these post IDs." },
+    { key: "auto_react_options.allow_user_ids", label: "Auto-React: Allow User IDs", type: "tags",
+      showWhen: { key: "features.auto_react", value: "true" },
+      help: "Only react to comments from these user IDs. Empty = all users. Deny list overrides." },
+    { key: "auto_react_options.deny_user_ids", label: "Auto-React: Deny User IDs", type: "tags",
+      showWhen: { key: "features.auto_react", value: "true" },
+      help: "Never react to comments from these user IDs." },
+    { key: "allow_from", label: "Allowed Users", type: "tags", help: "Sender IDs to whitelist. Empty = accept all." },
+    { key: "block_reply", label: "Block Reply", type: "select", options: blockReplyOptions, defaultValue: "inherit" },
+  ],
+  bitrix24: [
+    { key: "portal", label: "Portal", type: "text", required: true, placeholder: "my-portal", help: "Select an existing Bitrix24 portal, or click \"+ Create new portal\" to connect a new one." },
+    { key: "bot_code", label: "Bot Code", type: "text", required: true, placeholder: "support_bot", help: "Stable key passed to imbot.register. Must be unique per portal." },
+    { key: "bot_name", label: "Bot Name", type: "text", required: true, placeholder: "Support Bot", help: "Display name shown in Bitrix24 chats." },
+    { key: "bot_type", label: "Bot Type", type: "select", options: [
+      { value: "B", label: "B — Standard internal bot (default)" },
+      { value: "O", label: "O — Open Channel bot (customer-facing queue)" },
+    ], defaultValue: "B", help: "Forwarded verbatim to imbot.register TYPE. \"B\" = standard internal bot for portal users. \"O\" = Open Channel bot attached to a queue; per-user MCP credential minting is skipped because senders are transient customers." },
+    { key: "bot_avatar", label: "Bot Avatar URL", type: "text", placeholder: "https://...", help: "Optional avatar URL — fetched and base64-encoded at Start()." },
+    // public_url removed: gateway URL is now captured automatically from the
+    // install handler request and stored on the portal row.
+    { key: "dm_policy", label: "DM Policy", type: "select", options: dmPolicyOptions, defaultValue: "pairing" },
+    { key: "group_policy", label: "Group Policy", type: "select", options: groupPolicyOptions, defaultValue: "open" },
+    { key: "require_mention", label: "Require @mention in groups", type: "boolean", defaultValue: true, help: "Only respond in group chats when the bot is explicitly @mentioned." },
+    { key: "history_limit", label: "Group History Limit", type: "number", defaultValue: 0, help: "Max pending group messages for context (0 = disabled)" },
+    { key: "streaming", label: "Streaming", type: "boolean", defaultValue: true, help: "Stream response progressively." },
+    { key: "reaction_level", label: "Reaction Level", type: "select", options: [{ value: "off", label: "Off" }, { value: "minimal", label: "Minimal" }, { value: "full", label: "Full" }], defaultValue: "minimal", help: "Typing/status reactions while the agent is processing." },
+    { key: "text_chunk_limit", label: "Text Chunk Limit", type: "number", defaultValue: 4000, help: "Max characters per outbound message." },
+    { key: "media_max_mb", label: "Max Media Size (MB)", type: "number", defaultValue: 20, help: "Max inbound media download size." },
+    { key: "allow_from", label: "Allowed Users (DM)", type: "tags", help: "Bitrix24 user IDs allowed to DM the bot. Empty = no allowlist filter." },
+    { key: "group_allow_from", label: "Allowed Users (Group)", type: "tags", help: "Separate allowlist for group senders." },
+    { key: "block_reply", label: "Block Reply", type: "select", options: blockReplyOptions, defaultValue: "inherit", help: "Deliver intermediate text during tool iterations." },
+    { key: "mcp_server_name", label: "MCP Server Name", type: "text", advanced: true, placeholder: "bitrix24-prod", help: "Optional — name from mcp_servers table. Must be set together with MCP Base URL to enable per-user MCP credential auto-onboard. Leave both empty to disable." },
+    { key: "mcp_base_url", label: "MCP Base URL", type: "text", advanced: true, placeholder: "https://mcp.example.com", help: "Optional — HTTPS root of the partner MCP server. Channel POSTs {mcp_base_url}/api/auto-onboard to mint per-user credentials on first-sight. The MCP server authenticates each call via the caller's Bitrix access_token, so no admin secret is required." },
   ],
 };
 
@@ -222,5 +331,10 @@ export const wizardConfig: Partial<Record<string, WizardConfig>> = {
     createLabel: "wizard.zaloPersonal.createLabel",
     formBanner: "wizard.zaloPersonal.formBanner",
     excludeConfigFields: ["allow_from"],
+  },
+  whatsapp: {
+    steps: ["auth"],
+    createLabel: "wizard.whatsapp.createLabel",
+    formBanner: "wizard.whatsapp.formBanner",
   },
 };

@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	"github.com/nextlevelbuilder/goclaw/internal/providers"
+	usagecaps "github.com/nextlevelbuilder/goclaw/internal/usage/caps"
 )
 
 // textReadableMIMEs are MIME types whose content can be returned directly without LLM analysis.
@@ -49,14 +50,17 @@ func MediaDocRefsFromCtx(ctx context.Context) []providers.MediaRef {
 const documentMaxBytes = 20 * 1024 * 1024
 
 // documentProviderPriority is the order in which providers are tried for document analysis.
-// Gemini has best native PDF support (50MB, 258 tokens/page).
-// "alibaba" is included as an alias for dashscope (common DB registration name).
-var documentProviderPriority = []string{"gemini", "anthropic", "openrouter", "dashscope"}
+// Gemini has best native PDF support (50MB, 258 tokens/page). claude-cli is
+// included so installations with only Claude CLI configured can still analyze
+// PDFs via the CLI bridge (document content block in stream-json).
+var documentProviderPriority = []string{"gemini", "anthropic", "claude-cli", "openrouter", "dashscope"}
 
 // documentModelDefaults maps provider names to preferred document-capable models.
+// Empty string lets the provider pick its own default model.
 var documentModelDefaults = map[string]string{
 	"gemini":     "gemini-2.5-flash",
 	"openrouter": "google/gemini-2.5-flash",
+	"claude-cli": "",
 	"dashscope":  "qwen-vl-max",
 }
 
@@ -65,10 +69,15 @@ var documentModelDefaults = map[string]string{
 type ReadDocumentTool struct {
 	registry    *providers.Registry
 	mediaLoader MediaPathLoader
+	usageCaps   *usagecaps.Service
 }
 
 func NewReadDocumentTool(registry *providers.Registry, mediaLoader MediaPathLoader) *ReadDocumentTool {
 	return &ReadDocumentTool{registry: registry, mediaLoader: mediaLoader}
+}
+
+func (t *ReadDocumentTool) SetUsageCapService(svc *usagecaps.Service) {
+	t.usageCaps = svc
 }
 
 func (t *ReadDocumentTool) Name() string { return "read_document" }
@@ -91,6 +100,10 @@ func (t *ReadDocumentTool) Parameters() map[string]any {
 				"type":        "string",
 				"description": "Optional: specific media_id from <media:document> tag. If omitted, uses most recent document.",
 			},
+			"path": map[string]any{
+				"type":        "string",
+				"description": "Optional file path from a <media:document path=\"...\"> tag. Use this when the tag provides a path or the file is an archive that should be inspected with exec.",
+			},
 		},
 		"required": []string{"prompt"},
 	}
@@ -102,14 +115,22 @@ func (t *ReadDocumentTool) Execute(ctx context.Context, args map[string]any) *Re
 		prompt = "Analyze this document and describe its contents."
 	}
 	mediaID, _ := args["media_id"].(string)
+	docPathArg, _ := args["path"].(string)
 
 	// Resolve document file path from MediaRefs in context.
-	docPath, docMime, err := t.resolveDocumentFile(ctx, mediaID)
+	docPath, docMime, err := t.resolveDocumentFile(ctx, mediaID, docPathArg)
 	if err != nil {
 		return ErrorResult(err.Error())
 	}
 
 	slog.Info("read_document: resolved file", "path", docPath, "mime", docMime, "media_id", mediaID)
+
+	if isArchiveDocumentPath(docPath) {
+		return NewResult(fmt.Sprintf(
+			"Archive file available at %s. read_document does not analyze archive containers directly. Use exec to inspect or extract it, for example: unzip -l %q or unzip -q %q -d <output-dir>, then use list_files/read_file on extracted files.",
+			docPath, docPath, docPath,
+		))
+	}
 
 	// Read document file.
 	data, err := os.ReadFile(docPath)

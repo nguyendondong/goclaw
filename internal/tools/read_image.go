@@ -10,6 +10,7 @@ import (
 	"strings"
 
 	"github.com/nextlevelbuilder/goclaw/internal/providers"
+	usagecaps "github.com/nextlevelbuilder/goclaw/internal/usage/caps"
 )
 
 // --- Context helpers for media images ---
@@ -30,23 +31,32 @@ func MediaImagesFromCtx(ctx context.Context) []providers.ImageContent {
 // --- ReadImageTool ---
 
 // visionProviderPriority is the order in which providers are tried for vision.
-var visionProviderPriority = []string{"openrouter", "gemini", "anthropic", "dashscope"}
+// claude-cli follows anthropic so installations with a native Anthropic API key
+// keep using the faster direct API, while claude-cli-only setups still resolve.
+var visionProviderPriority = []string{"openrouter", "gemini", "anthropic", "claude-cli", "dashscope"}
 
 // visionModelDefaults maps provider names to preferred vision models.
+// Empty string lets the provider pick its own default model.
 var visionModelDefaults = map[string]string{
 	"openrouter": "google/gemini-2.5-flash-image",
 	"gemini":     "gemini-2.5-flash",
 	"anthropic":  "",
+	"claude-cli": "",
 	"dashscope":  "qwen3-vl",
 }
 
 // ReadImageTool uses a vision-capable provider to describe images attached to the current message.
 type ReadImageTool struct {
-	registry *providers.Registry
+	registry  *providers.Registry
+	usageCaps *usagecaps.Service
 }
 
 func NewReadImageTool(registry *providers.Registry) *ReadImageTool {
 	return &ReadImageTool{registry: registry}
+}
+
+func (t *ReadImageTool) SetUsageCapService(svc *usagecaps.Service) {
+	t.usageCaps = svc
 }
 
 func (t *ReadImageTool) Name() string { return "read_image" }
@@ -136,7 +146,19 @@ func (t *ReadImageTool) callProvider(ctx context.Context, cp credentialProvider,
 
 	slog.Info("read_image: calling vision provider", "provider", providerName, "model", model, "images", len(images))
 
-	resp, err := p.Chat(ctx, providers.ChatRequest{
+	opts := map[string]any{
+		"max_tokens":  1024,
+		"temperature": 0.3,
+	}
+	// claude-cli spawns the Claude CLI binary; loading its built-in MCP
+	// toolset costs latency we don't need for a one-shot vision call. Keep
+	// this flag scoped to claude-cli so other providers don't receive
+	// options they ignore (or worse, choke on in the future).
+	if providerName == "claude-cli" {
+		opts["disable_tools"] = true
+	}
+
+	chatReq := providers.ChatRequest{
 		Messages: []providers.Message{
 			{
 				Role:    "user",
@@ -144,12 +166,17 @@ func (t *ReadImageTool) callProvider(ctx context.Context, cp credentialProvider,
 				Images:  images,
 			},
 		},
-		Model: model,
-		Options: map[string]any{
-			"max_tokens":  1024,
-			"temperature": 0.3,
-		},
-	})
+		Model:   model,
+		Options: opts,
+	}
+	reservation, reserveErr := reserveToolLLMUsage(ctx, t.usageCaps, t.Name(), providerName, model, chatReq)
+	if reserveErr != nil {
+		return nil, nil, reserveErr
+	}
+	resp, err := p.Chat(ctx, chatReq)
+	if reservation != nil {
+		reservation.Reconcile(ctx, resp, err)
+	}
 	if err != nil {
 		return nil, nil, fmt.Errorf("vision provider error: %w", err)
 	}

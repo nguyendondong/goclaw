@@ -1,7 +1,6 @@
 package http
 
 import (
-	"encoding/json"
 	"log/slog"
 	"net/http"
 
@@ -23,7 +22,10 @@ func (h *MemoryHandler) handleListAllDocuments(w http.ResponseWriter, r *http.Re
 }
 
 func (h *MemoryHandler) handleListDocuments(w http.ResponseWriter, r *http.Request) {
-	agentID := r.PathValue("agentID")
+	agentID, ok := h.resolveAgentID(w, r)
+	if !ok {
+		return
+	}
 	userID := r.URL.Query().Get("user_id")
 
 	var docs []store.DocumentInfo
@@ -46,7 +48,10 @@ func (h *MemoryHandler) handleListDocuments(w http.ResponseWriter, r *http.Reque
 
 func (h *MemoryHandler) handleGetDocument(w http.ResponseWriter, r *http.Request) {
 	locale := extractLocale(r)
-	agentID := r.PathValue("agentID")
+	agentID, ok := h.resolveAgentID(w, r)
+	if !ok {
+		return
+	}
 	path := r.PathValue("path")
 	userID := r.URL.Query().Get("user_id")
 
@@ -61,15 +66,17 @@ func (h *MemoryHandler) handleGetDocument(w http.ResponseWriter, r *http.Request
 
 func (h *MemoryHandler) handlePutDocument(w http.ResponseWriter, r *http.Request) {
 	locale := extractLocale(r)
-	agentID := r.PathValue("agentID")
+	agentID, ok := h.resolveAgentID(w, r)
+	if !ok {
+		return
+	}
 	path := r.PathValue("path")
 
 	var body struct {
 		Content string `json:"content"`
 		UserID  string `json:"user_id"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": i18n.T(locale, i18n.MsgInvalidJSON)})
+	if !bindJSON(w, r, locale, &body) {
 		return
 	}
 
@@ -82,7 +89,10 @@ func (h *MemoryHandler) handlePutDocument(w http.ResponseWriter, r *http.Request
 }
 
 func (h *MemoryHandler) handleDeleteDocument(w http.ResponseWriter, r *http.Request) {
-	agentID := r.PathValue("agentID")
+	agentID, ok := h.resolveAgentID(w, r)
+	if !ok {
+		return
+	}
 	path := r.PathValue("path")
 	userID := r.URL.Query().Get("user_id")
 
@@ -96,7 +106,10 @@ func (h *MemoryHandler) handleDeleteDocument(w http.ResponseWriter, r *http.Requ
 
 func (h *MemoryHandler) handleListChunks(w http.ResponseWriter, r *http.Request) {
 	locale := extractLocale(r)
-	agentID := r.PathValue("agentID")
+	agentID, ok := h.resolveAgentID(w, r)
+	if !ok {
+		return
+	}
 	path := r.URL.Query().Get("path")
 	userID := r.URL.Query().Get("user_id")
 
@@ -119,14 +132,16 @@ func (h *MemoryHandler) handleListChunks(w http.ResponseWriter, r *http.Request)
 
 func (h *MemoryHandler) handleIndexDocument(w http.ResponseWriter, r *http.Request) {
 	locale := extractLocale(r)
-	agentID := r.PathValue("agentID")
+	agentID, ok := h.resolveAgentID(w, r)
+	if !ok {
+		return
+	}
 
 	var body struct {
 		Path   string `json:"path"`
 		UserID string `json:"user_id"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": i18n.T(locale, i18n.MsgInvalidJSON)})
+	if !bindJSON(w, r, locale, &body) {
 		return
 	}
 	if body.Path == "" {
@@ -143,12 +158,18 @@ func (h *MemoryHandler) handleIndexDocument(w http.ResponseWriter, r *http.Reque
 }
 
 func (h *MemoryHandler) handleIndexAll(w http.ResponseWriter, r *http.Request) {
-	agentID := r.PathValue("agentID")
+	locale := extractLocale(r)
+	agentID, ok := h.resolveAgentID(w, r)
+	if !ok {
+		return
+	}
 
 	var body struct {
 		UserID string `json:"user_id"`
 	}
-	json.NewDecoder(r.Body).Decode(&body)
+	if !bindJSON(w, r, locale, &body) {
+		return
+	}
 	if body.UserID == "" {
 		body.UserID = extractUserID(r)
 	}
@@ -163,7 +184,10 @@ func (h *MemoryHandler) handleIndexAll(w http.ResponseWriter, r *http.Request) {
 
 func (h *MemoryHandler) handleSearch(w http.ResponseWriter, r *http.Request) {
 	locale := extractLocale(r)
-	agentID := r.PathValue("agentID")
+	agentID, ok := h.resolveAgentID(w, r)
+	if !ok {
+		return
+	}
 
 	var body struct {
 		Query      string  `json:"query"`
@@ -171,8 +195,7 @@ func (h *MemoryHandler) handleSearch(w http.ResponseWriter, r *http.Request) {
 		MaxResults int     `json:"max_results"`
 		MinScore   float64 `json:"min_score"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": i18n.T(locale, i18n.MsgInvalidJSON)})
+	if !bindJSON(w, r, locale, &body) {
 		return
 	}
 	if body.Query == "" {

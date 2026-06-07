@@ -8,6 +8,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/nextlevelbuilder/goclaw/internal/bus"
+	"github.com/nextlevelbuilder/goclaw/internal/channels"
 	"github.com/nextlevelbuilder/goclaw/internal/gateway"
 	"github.com/nextlevelbuilder/goclaw/internal/i18n"
 	"github.com/nextlevelbuilder/goclaw/internal/store"
@@ -22,16 +23,42 @@ var channelInstanceAllowed = map[string]bool{
 	"display_name": true,
 }
 
+// OrphanChannelCleaner runs channel-type-specific cleanup when a delete
+// arrives for a channel that is no longer loaded in the runtime Manager
+// (e.g. admin disabled it earlier). Closure injected from cmd/gateway.go.
+// See identical type in internal/http/channel_instances.go.
+type OrphanChannelCleaner func(ctx context.Context, tenantID uuid.UUID, configJSON []byte) error
+
 // ChannelInstancesMethods handles channel instance CRUD via WebSocket RPC.
+// agentStore is held so the create/update handlers can resolve agent_key or
+// UUID input via resolveAgentUUIDCached.
 type ChannelInstancesMethods struct {
-	store    store.ChannelInstanceStore
-	msgBus   *bus.MessageBus
-	eventBus bus.EventPublisher
+	store      store.ChannelInstanceStore
+	agentStore store.AgentStore
+	msgBus     *bus.MessageBus
+	eventBus   bus.EventPublisher
+	channelMgr *channels.Manager // optional — enables ChannelDestroyer hook on delete
+	// orphanCleaners is keyed by channel_type; called when channelMgr.GetChannel
+	// returns false (channel was unloaded — typically due to disable).
+	orphanCleaners map[string]OrphanChannelCleaner
 }
 
 // NewChannelInstancesMethods creates a new handler for channel instance management.
-func NewChannelInstancesMethods(s store.ChannelInstanceStore, msgBus *bus.MessageBus, eventBus bus.EventPublisher) *ChannelInstancesMethods {
-	return &ChannelInstancesMethods{store: s, msgBus: msgBus, eventBus: eventBus}
+// channelMgr is optional; when non-nil and the channel's runtime impl
+// satisfies channels.ChannelDestroyer, handleDelete invokes Destroy() before
+// removing the DB row so external resources (e.g. Bitrix24 bots) get cleaned.
+func NewChannelInstancesMethods(s store.ChannelInstanceStore, as store.AgentStore, msgBus *bus.MessageBus, eventBus bus.EventPublisher, channelMgr *channels.Manager) *ChannelInstancesMethods {
+	return &ChannelInstancesMethods{store: s, agentStore: as, msgBus: msgBus, eventBus: eventBus, channelMgr: channelMgr}
+}
+
+// RegisterOrphanCleaner registers a per-channel-type cleanup function that
+// fires when handleDelete sees a channel NOT loaded in Manager (typically
+// because admin disabled it). See HTTP twin for full rationale.
+func (m *ChannelInstancesMethods) RegisterOrphanCleaner(channelType string, fn OrphanChannelCleaner) {
+	if m.orphanCleaners == nil {
+		m.orphanCleaners = make(map[string]OrphanChannelCleaner)
+	}
+	m.orphanCleaners[channelType] = fn
 }
 
 // Register registers all channel instance RPC methods.
@@ -122,7 +149,10 @@ func (m *ChannelInstancesMethods) handleCreate(ctx context.Context, client *gate
 		return
 	}
 
-	agentID, err := uuid.Parse(params.AgentID)
+	// Accept both agent_key and UUID via resolveAgentUUIDCached. Router is nil
+	// here because channel_instances methods are not wired to the router —
+	// falls back to a pure DB lookup, acceptable given create is a rare op.
+	agentID, err := resolveAgentUUIDCached(ctx, nil, m.agentStore, params.AgentID)
 	if err != nil {
 		client.SendResponse(protocol.NewErrorResponse(req.ID, protocol.ErrInvalidRequest, i18n.T(locale, i18n.MsgInvalidID, "agent_id")))
 		return
@@ -223,6 +253,26 @@ func (m *ChannelInstancesMethods) handleDelete(ctx context.Context, client *gate
 		return
 	}
 
+	// Best-effort: notify the channel impl so external resources (e.g. the
+	// Bitrix24 imbot.register'd bot) get cleaned up BEFORE the DB row is
+	// removed. Mirror of HTTP handler — see internal/http/channel_instances.go
+	// for full rationale on the two branches.
+	if m.channelMgr != nil {
+		if ch, ok := m.channelMgr.GetChannel(inst.Name); ok {
+			if destroyer, ok := ch.(channels.ChannelDestroyer); ok {
+				if err := destroyer.Destroy(ctx); err != nil {
+					slog.Warn("channels.instances.delete: destroyer failed — proceeding with DB delete",
+						"name", inst.Name, "tenant_id", inst.TenantID, "type", inst.ChannelType, "err", err)
+				}
+			}
+		} else if cleaner, ok := m.orphanCleaners[inst.ChannelType]; ok && cleaner != nil {
+			if err := cleaner(ctx, inst.TenantID, inst.Config); err != nil {
+				slog.Warn("channels.instances.delete: orphan cleaner failed — proceeding with DB delete",
+					"name", inst.Name, "tenant_id", inst.TenantID, "type", inst.ChannelType, "err", err)
+			}
+		}
+	}
+
 	if err := m.store.Delete(ctx, id); err != nil {
 		slog.Error("channels.instances.delete", "error", err)
 		client.SendResponse(protocol.NewErrorResponse(req.ID, protocol.ErrInternal, i18n.T(locale, i18n.MsgFailedToDelete, "instance", err.Error())))
@@ -271,9 +321,15 @@ func maskInstance(inst store.ChannelInstanceData) map[string]any {
 }
 
 // isValidChannelType checks if the channel type is supported.
+//
+// Keep this list in sync with the HTTP twin in internal/http/channel_instances.go
+// and with CHANNEL_TYPES in ui/web/src/constants/channels.ts. When the two
+// backend switches drift (as happened with facebook/pancake/bitrix24), the
+// WS-driven UI rejects channels the HTTP API accepts, and the dropdown offers
+// channels neither API accepts.
 func isValidChannelType(ct string) bool {
 	switch ct {
-	case "telegram", "discord", "slack", "whatsapp", "zalo_oa", "zalo_personal", "feishu":
+	case "telegram", "discord", "slack", "whatsapp", "zalo_oa", "zalo_personal", "feishu", "facebook", "pancake", "bitrix24":
 		return true
 	}
 	return false

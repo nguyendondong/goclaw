@@ -131,8 +131,8 @@ func (p *Pool) Acquire(ctx context.Context, tenantID uuid.UUID, name, transportT
 		if old.state.cancel != nil {
 			old.state.cancel()
 		}
-		if old.state.client != nil {
-			_ = old.state.client.Close()
+		if client := old.state.clientPtr.Load(); client != nil {
+			_ = client.Close()
 		}
 		delete(p.servers, key)
 		// Return slot to semaphore
@@ -216,8 +216,8 @@ func (p *Pool) AcquireUser(ctx context.Context, tenantID uuid.UUID, name, userID
 		if old.state.cancel != nil {
 			old.state.cancel()
 		}
-		if old.state.client != nil {
-			_ = old.state.client.Close()
+		if client := old.state.clientPtr.Load(); client != nil {
+			_ = client.Close()
 		}
 		delete(p.userServers, key)
 		// Return slot to per-server semaphore
@@ -390,8 +390,8 @@ func (p *Pool) Stop() {
 		if entry.state.cancel != nil {
 			entry.state.cancel()
 		}
-		if entry.state.client != nil {
-			_ = entry.state.client.Close()
+		if client := entry.state.clientPtr.Load(); client != nil {
+			_ = client.Close()
 		}
 		slog.Debug("mcp.pool.stopped", "key", key)
 	}
@@ -401,8 +401,8 @@ func (p *Pool) Stop() {
 		if entry.state.cancel != nil {
 			entry.state.cancel()
 		}
-		if entry.state.client != nil {
-			_ = entry.state.client.Close()
+		if client := entry.state.clientPtr.Load(); client != nil {
+			_ = client.Close()
 		}
 		slog.Debug("mcp.pool.user.stopped", "key", key)
 	}
@@ -423,8 +423,8 @@ func (p *Pool) Evict(tenantID uuid.UUID, serverName string) {
 	if entry.state.cancel != nil {
 		entry.state.cancel()
 	}
-	if entry.state.client != nil {
-		_ = entry.state.client.Close()
+	if client := entry.state.clientPtr.Load(); client != nil {
+		_ = client.Close()
 	}
 	delete(p.servers, key)
 	select {
@@ -481,8 +481,8 @@ func (p *Pool) evictIdle() {
 			if entry.state.cancel != nil {
 				entry.state.cancel()
 			}
-			if entry.state.client != nil {
-				_ = entry.state.client.Close()
+			if client := entry.state.clientPtr.Load(); client != nil {
+				_ = client.Close()
 			}
 			delete(p.servers, key)
 			select {
@@ -499,8 +499,8 @@ func (p *Pool) evictIdle() {
 			if entry.state.cancel != nil {
 				entry.state.cancel()
 			}
-			if entry.state.client != nil {
-				_ = entry.state.client.Close()
+			if client := entry.state.clientPtr.Load(); client != nil {
+				_ = client.Close()
 			}
 			delete(p.userServers, key)
 			// Return slot to per-server semaphore
@@ -588,8 +588,9 @@ func (p *Pool) evictOldestIdleLocked() bool {
 	return true
 }
 
-// Client returns the MCP client for this pool entry.
-func (e *poolEntry) Client() *mcpclient.Client { return e.state.client }
+// ClientPtr returns the atomic client pointer for this pool entry.
+// Used by BridgeTools to atomically load the current client during reconnect.
+func (e *poolEntry) ClientPtr() *atomic.Pointer[mcpclient.Client] { return &e.state.clientPtr }
 
 // Connected returns a pointer to the connected flag for this pool entry.
 func (e *poolEntry) Connected() *atomic.Bool { return &e.state.connected }
@@ -597,7 +598,18 @@ func (e *poolEntry) Connected() *atomic.Bool { return &e.state.connected }
 // MCPTools returns the discovered MCP tool definitions for this pool entry.
 func (e *poolEntry) MCPTools() []mcpgo.Tool { return e.tools }
 
+// RequestForceReconnect triggers an out-of-band Initialize when a BridgeTool
+// detects the server-side session was reset (see isSessionUninitializedErr).
+// Returns a closure to keep BridgeTool decoupled from *serverState.
+// Concurrent invocations dedupe via the underlying CAS guard.
+func (e *poolEntry) RequestForceReconnect() func(reason string) {
+	ss := e.state
+	return func(reason string) { ss.requestForceReconnect(reason) }
+}
+
 // poolHealthLoop is a standalone health loop for pool-managed connections.
+// After consecutive ping failures, it attempts a full reconnect by creating
+// a fresh client, mirroring the Manager.tryReconnect slow path.
 func poolHealthLoop(ctx context.Context, ss *serverState) {
 	ticker := newHealthTicker()
 	defer ticker.Stop()
@@ -607,6 +619,14 @@ func poolHealthLoop(ctx context.Context, ss *serverState) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
+			// Skip ping while a force-reconnect is in flight (see
+			// requestForceReconnect). Pinging here races the recovery
+			// goroutine and would clobber connected=true on servers that
+			// answer `ping` even in the post-reset "initializing" state.
+			if ss.reconnPending.Load() {
+				slog.Debug("mcp.pool.health_skip", "server", ss.name, "reason", "reconnect_pending")
+				continue
+			}
 			if err := ss.client.Ping(ctx); err != nil {
 				if isMethodNotFound(err) {
 					ss.connected.Store(true)
@@ -625,6 +645,7 @@ func poolHealthLoop(ctx context.Context, ss *serverState) {
 
 				if failures >= healthFailThreshold {
 					ss.connected.Store(false)
+					poolTryReconnect(ctx, ss)
 				}
 			} else {
 				ss.connected.Store(true)
@@ -636,4 +657,10 @@ func poolHealthLoop(ctx context.Context, ss *serverState) {
 			}
 		}
 	}
+}
+
+// poolTryReconnect attempts reconnect for a pool-managed connection.
+// Delegates to the shared reconnectWithBackoff with pool-specific log prefix.
+func poolTryReconnect(ctx context.Context, ss *serverState) {
+	reconnectWithBackoff(ctx, ss, "mcp.pool")
 }

@@ -8,6 +8,7 @@ import (
 	"os"
 	"strings"
 
+	"github.com/nextlevelbuilder/goclaw/internal/audio"
 	"github.com/nextlevelbuilder/goclaw/internal/bootstrap"
 	"github.com/nextlevelbuilder/goclaw/internal/config"
 	"github.com/nextlevelbuilder/goclaw/internal/gateway"
@@ -42,9 +43,26 @@ func (m *AgentsMethods) handleUpdate(ctx context.Context, client *gateway.Client
 		CompactionConfig json.RawMessage `json:"compaction_config,omitempty"`
 		ContextPruning   json.RawMessage `json:"context_pruning,omitempty"`
 		OtherConfig      json.RawMessage `json:"other_config,omitempty"`
+		// Promoted config fields
+		Emoji               *string         `json:"emoji,omitempty"`
+		AgentDescription    *string         `json:"agent_description,omitempty"`
+		ThinkingLevel       *string         `json:"thinking_level,omitempty"`
+		MaxTokens           *int            `json:"max_tokens,omitempty"`
+		SelfEvolve          *bool           `json:"self_evolve,omitempty"`
+		SkillEvolve         *bool           `json:"skill_evolve,omitempty"`
+		SkillNudgeInterval  *int            `json:"skill_nudge_interval,omitempty"`
+		ReasoningConfig     json.RawMessage `json:"reasoning_config,omitempty"`
+		WorkspaceSharing    json.RawMessage `json:"workspace_sharing,omitempty"`
+		ChatGPTOAuthRouting json.RawMessage `json:"chatgpt_oauth_routing,omitempty"`
+		ShellDenyGroups     json.RawMessage `json:"shell_deny_groups,omitempty"`
+		KGDedupConfig       json.RawMessage `json:"kg_dedup_config,omitempty"`
 	}
 	if req.Params != nil {
 		json.Unmarshal(req.Params, &params)
+	}
+	var rawParams map[string]json.RawMessage
+	if req.Params != nil {
+		_ = json.Unmarshal(req.Params, &rawParams)
 	}
 
 	if params.AgentID == "" {
@@ -90,7 +108,9 @@ func (m *AgentsMethods) handleUpdate(ctx context.Context, client *gateway.Client
 		if params.IsDefault != nil {
 			updates["is_default"] = *params.IsDefault
 		}
-		if params.BudgetCents != nil {
+		if rawBudget, ok := rawParams["budget_monthly_cents"]; ok && strings.TrimSpace(string(rawBudget)) == "null" {
+			updates["budget_monthly_cents"] = nil
+		} else if params.BudgetCents != nil {
 			updates["budget_monthly_cents"] = *params.BudgetCents
 		}
 		// Per-agent JSONB config overrides
@@ -113,7 +133,65 @@ func (m *AgentsMethods) handleUpdate(ctx context.Context, client *gateway.Client
 			updates["context_pruning"] = []byte(params.ContextPruning)
 		}
 		if len(params.OtherConfig) > 0 {
+			// Validate v3 flag values (must be boolean) before persisting.
+			var otherMap map[string]any
+			if json.Unmarshal(params.OtherConfig, &otherMap) == nil {
+				if err := store.ValidateV3Flags(otherMap); err != nil {
+					client.SendResponse(protocol.NewErrorResponse(req.ID, protocol.ErrInvalidRequest, err.Error()))
+					return
+				}
+				// Finding #5: validate tts_params allow-list via shared audio validator
+				// (Action D: single source of truth in internal/audio).
+				if tp, ok := otherMap["tts_params"]; ok && tp != nil {
+					if tpMap, ok := tp.(map[string]any); ok {
+						if err := audio.ValidateAgentTTSParams(tpMap); err != nil {
+							client.SendResponse(protocol.NewErrorResponse(req.ID, protocol.ErrInvalidRequest, err.Error()))
+							return
+						}
+					}
+				}
+			}
 			updates["other_config"] = []byte(params.OtherConfig)
+		}
+		// Promoted config fields
+		if params.Emoji != nil {
+			updates["emoji"] = *params.Emoji
+		}
+		if params.AgentDescription != nil {
+			updates["agent_description"] = *params.AgentDescription
+		}
+		if params.ThinkingLevel != nil {
+			updates["thinking_level"] = *params.ThinkingLevel
+		}
+		if params.MaxTokens != nil {
+			updates["max_tokens"] = *params.MaxTokens
+		}
+		if params.SelfEvolve != nil {
+			updates["self_evolve"] = *params.SelfEvolve
+		}
+		if params.SkillEvolve != nil {
+			updates["skill_evolve"] = *params.SkillEvolve
+		}
+		if params.SkillNudgeInterval != nil {
+			v := max(*params.SkillNudgeInterval,
+				// DB column is NOT NULL DEFAULT 0
+				0)
+			updates["skill_nudge_interval"] = v
+		}
+		if len(params.ReasoningConfig) > 0 {
+			updates["reasoning_config"] = []byte(params.ReasoningConfig)
+		}
+		if len(params.WorkspaceSharing) > 0 {
+			updates["workspace_sharing"] = []byte(params.WorkspaceSharing)
+		}
+		if len(params.ChatGPTOAuthRouting) > 0 {
+			updates["chatgpt_oauth_routing"] = []byte(params.ChatGPTOAuthRouting)
+		}
+		if len(params.ShellDenyGroups) > 0 {
+			updates["shell_deny_groups"] = []byte(params.ShellDenyGroups)
+		}
+		if len(params.KGDedupConfig) > 0 {
+			updates["kg_dedup_config"] = []byte(params.KGDedupConfig)
 		}
 
 		if len(updates) > 0 {
@@ -175,10 +253,11 @@ func (m *AgentsMethods) handleUpdate(ctx context.Context, client *gateway.Client
 			}
 		}
 
+		// Post-Phase-2 canonicalization: router cache entries are always keyed
+		// as `tenantID:agent_key`. The previous belt-and-suspenders UUID-based
+		// invalidation was dead code — exact-segment match never matches a
+		// UUID as the final segment of a canonical cache key.
 		m.agents.InvalidateAgent(params.AgentID)
-		// Also invalidate by UUID — heartbeat/cron sessions cached under UUID key
-		// before the agentKey fix may still be in the router cache.
-		m.agents.InvalidateAgent(ag.ID.String())
 	}
 
 	client.SendResponse(protocol.NewOKResponse(req.ID, map[string]any{

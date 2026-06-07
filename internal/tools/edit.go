@@ -16,11 +16,21 @@ import (
 type EditTool struct {
 	workspace       string
 	restrict        bool
+	allowedPrefixes []string // extra allowed path prefixes (cross-drive on Windows)
 	deniedPrefixes  []string // path prefixes to deny access to (e.g. .goclaw)
 	sandboxMgr      sandbox.Manager
 	contextFileIntc *ContextFileInterceptor
 	memIntc         *MemoryInterceptor
+	vaultIntc       *VaultInterceptor
 	permStore       store.ConfigPermissionStore // nil = no group write restriction
+}
+
+func (t *EditTool) SetVaultInterceptor(v *VaultInterceptor) { t.vaultIntc = v }
+
+// AllowPaths adds extra path prefixes that edit is allowed to access
+// even when restrict_to_workspace is true (e.g. cross-drive on Windows).
+func (t *EditTool) AllowPaths(prefixes ...string) {
+	t.allowedPrefixes = append(t.allowedPrefixes, prefixes...)
 }
 
 // DenyPaths adds path prefixes that edit must reject.
@@ -160,7 +170,7 @@ func (t *EditTool) Execute(ctx context.Context, args map[string]any) *Result {
 	if workspace == "" {
 		workspace = t.workspace
 	}
-	allowed := allowedWithTeamWorkspace(ctx, nil)
+	allowed := allowedWriteWithTeamWorkspace(ctx, t.allowedPrefixes)
 	resolved, err := resolvePathWithAllowed(path, workspace, effectiveRestrict(ctx, t.restrict), allowed)
 	if err != nil {
 		return ErrorResult(err.Error())
@@ -188,6 +198,10 @@ func (t *EditTool) Execute(ctx context.Context, args map[string]any) *Result {
 		return ErrorResult(fmt.Sprintf("failed to write file: %v", err))
 	}
 
+	if t.vaultIntc != nil {
+		go t.vaultIntc.AfterWrite(context.WithoutCancel(ctx), resolved, newContent)
+	}
+
 	count := strings.Count(content, oldStr)
 	return SilentResult(fmt.Sprintf("File edited: %s (%d replacement(s))", path, count))
 }
@@ -204,7 +218,7 @@ func (t *EditTool) executeInSandbox(ctx context.Context, path, oldStr, newStr st
 	}
 	containerPath := ResolveSandboxPath(path, containerCwd)
 
-	bridge := sandbox.NewFsBridge(sb.ID(), sandbox.DefaultContainerWorkdir)
+	bridge := sandbox.NewFsBridge(sb.ID(), containerCwd)
 	content, err := bridge.ReadFile(ctx, containerPath)
 	if err != nil {
 		return ErrorResult(fmt.Sprintf("failed to read file: %v", err) + MaybeFsBridgeHint(err))
